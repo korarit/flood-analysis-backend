@@ -1,0 +1,13 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1787430888429,
+      "tag": "0000_mean_shard",
+      "breakpoints": true
+    }
+  ]
+}
