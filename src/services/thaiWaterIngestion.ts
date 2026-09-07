@@ -72,8 +72,8 @@ export class ThaiWaterIngestionService {
     const month = pad(d.getMonth() + 1);
     const day = pad(d.getDate());
     const hours = pad(d.getHours());
-    const mins = pad(d.getMinutes());
-    return `${year}-${month}-${day} ${hours}:${mins}`;
+    // ThaiWater hourly rainfall requires :00 and waterlevel API requires round interval (multiples of 5/15)
+    return `${year}-${month}-${day} ${hours}:00`;
   }
 
   /**
@@ -594,6 +594,10 @@ export class ThaiWaterIngestionService {
       const waterList = await db.select().from(waterlevelStations).where(eq(waterlevelStations.basinId, b.id));
       totalStations += rainList.length + waterList.length;
 
+      console.log(`🌊 [${b.slug}] Syncing ${b.nameTh}: ${rainList.length} rainfall, ${waterList.length} waterlevel stations...`);
+      let basinSynced = 0;
+      let basinFailed = 0;
+
       const basinRainObservations: Array<{ rain1h: number; rain3h: number; rain24h: number; lat: number; nameTh: string; nameEn: string }> = [];
 
       // 1. Sync Rainfall Stations for this basin
@@ -602,14 +606,17 @@ export class ThaiWaterIngestionService {
           const res = await this.syncRainfallStation(st, b.slug);
           if (res.ok) {
             synced++;
+            basinSynced++;
             if (res.latestRain) {
               basinRainObservations.push(res.latestRain);
             }
           } else {
             failed++;
+            basinFailed++;
           }
         } catch (err: any) {
           failed++;
+          basinFailed++;
           errors.push({ stationId: st.id, error: err.message });
         }
       }
@@ -620,11 +627,14 @@ export class ThaiWaterIngestionService {
           const ok = await this.syncWaterlevelStation(st, b.slug, basinRainObservations);
           if (ok) {
             synced++;
+            basinSynced++;
           } else {
             failed++;
+            basinFailed++;
           }
         } catch (err: any) {
           failed++;
+          basinFailed++;
           errors.push({ stationId: st.id, error: err.message });
         }
       }
@@ -636,6 +646,8 @@ export class ThaiWaterIngestionService {
       } catch (pubErr) {
         console.warn(`⚠️ Warning publishing R2 aggregates for basin ${b.slug}:`, pubErr);
       }
+
+      console.log(`   ✅ [${b.slug}] Completed: ${basinSynced} synced, ${basinFailed} inactive. R2 snapshots updated.`);
     }
 
     // 4. Update root basins.json

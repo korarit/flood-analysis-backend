@@ -316,6 +316,9 @@ bun run dev
 | `bun run start` | รันเซิร์ฟเวอร์โหมด Production |
 | `bun run build` | คอมไพล์โปรเจกต์ด้วย Bun Bundler ไปยัง `dist/` |
 | `bun run typecheck` | ตรวจสอบ TypeScript Types (`tsc --noEmit`) |
+| `bun run sync` | รัน Scraper ดึงข้อมูลโทรมาตรจาก ThaiWater, อัปเดต DB และ Sync R2 (รองรับ `all` ทุกลุ่มน้ำ หรือระบุลุ่มน้ำ เช่น `bun run sync all`, `bun run sync yom`) |
+| `bun run sync:all` | รัน Scraper โทรมาตรทุกลุ่มน้ำ พร้อม Rebuild R2 Datasets ทั้งหมดใหม่ |
+| `bun run scraper` | คำสั่งทางเลือกสำหรับรัน Scraper ดึงข้อมูลโทรมาตร (รองรับ `bun run scraper all`) |
 | `bun run db:push` | ซิงค์ Drizzle Schema ไปยัง PostgreSQL โดยตรง |
 | `bun run db:migrate` | รันไฟล์ SQL Migrations |
 | `bun run db:studio` | เปิด [Drizzle Studio](https://orm.drizzle.team/drizzle-studio/overview) Web UI จัดการฐานข้อมูล |
