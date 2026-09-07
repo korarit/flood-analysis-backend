@@ -1,8 +1,10 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { env } from "../config/env";
 import { db } from "../db";
-import { basins, stations, telemetryHistory, telemetryLatest } from "../db/schema";
-import { FreshnessStatus, RainIntensity, SituationStatus, TrendDirection } from "../types";
+import { basins, rainfallStations, telemetryLatest, waterlevelStations } from "../db/schema";
+import { FreshnessStatus, RainIntensity, SituationStatus, StationCurrentDataset, TrendDirection } from "../types";
+import { r2Publisher } from "./r2PublisherService";
+import { r2Storage } from "./r2StorageService";
 
 export interface ThaiWaterHourlyRainItem {
   datetime: string;
@@ -64,9 +66,6 @@ export class ThaiWaterIngestionService {
     };
   }
 
-  /**
-   * Format Date to ThaiWater API query format: "YYYY-MM-DD HH:mm"
-   */
   private formatDateTime(d: Date): string {
     const pad = (n: number) => String(n).padStart(2, "0");
     const year = d.getFullYear();
@@ -78,7 +77,7 @@ export class ThaiWaterIngestionService {
   }
 
   /**
-   * Fetch Hourly Rainfall Graph data
+   * Fetch Day-by-Day (Last 24h or specified range) Hourly Rainfall Graph data
    */
   async fetchRainfallGraph(
     stationId: string,
@@ -86,7 +85,8 @@ export class ThaiWaterIngestionService {
     endDate?: string
   ): Promise<{ data: ThaiWaterHourlyRainItem[] } | null> {
     const end = endDate || this.formatDateTime(new Date());
-    const startObj = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // 7 days ago
+    // Default to Day-by-Day (1 day ago)
+    const startObj = new Date(Date.now() - 24 * 60 * 60 * 1000);
     const start = startDate || this.formatDateTime(startObj);
 
     const url = new URL(`${this.baseUrl}/data/platform/v1/public/rainfall_c60/graph`);
@@ -116,7 +116,7 @@ export class ThaiWaterIngestionService {
   }
 
   /**
-   * Fetch Water Level & Discharge Graph data
+   * Fetch Day-by-Day (Last 24h or specified range) Water Level & Discharge Graph data
    */
   async fetchWaterLevelGraph(
     stationId: string,
@@ -124,7 +124,8 @@ export class ThaiWaterIngestionService {
     endDate?: string
   ): Promise<ThaiWaterWaterLevelResponse | null> {
     const end = endDate || this.formatDateTime(new Date());
-    const startObj = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // 7 days ago
+    // Default to Day-by-Day (1 day ago)
+    const startObj = new Date(Date.now() - 24 * 60 * 60 * 1000);
     const start = startDate || this.formatDateTime(startObj);
 
     const url = new URL(`${this.baseUrl}/data/platform/v1/public/tele_waterlevel/graph`);
@@ -150,9 +151,6 @@ export class ThaiWaterIngestionService {
     }
   }
 
-  /**
-   * Helper to calculate Rain Intensity
-   */
   public calculateRainIntensity(rain24h: number | null): RainIntensity {
     if (rain24h === null || rain24h < 10) return "light";
     if (rain24h <= 35) return "moderate";
@@ -160,9 +158,6 @@ export class ThaiWaterIngestionService {
     return "very_heavy";
   }
 
-  /**
-   * Helper to calculate Freshness
-   */
   public calculateFreshness(timestamp: Date): FreshnessStatus {
     const diffMs = Date.now() - timestamp.getTime();
     const diffHours = diffMs / (1000 * 60 * 60);
@@ -171,9 +166,6 @@ export class ThaiWaterIngestionService {
     return "missing";
   }
 
-  /**
-   * Helper to determine Trend direction from sequential values
-   */
   public calculateTrend(values: (number | null)[]): TrendDirection {
     const valid = values.filter((v): v is number => v !== null && typeof v === "number");
     if (valid.length < 2) return "steady";
@@ -186,251 +178,377 @@ export class ThaiWaterIngestionService {
   }
 
   /**
-   * Sync telemetry for a single station from ThaiWater API and persist to DB
+   * Helper: Append daily observations to 7-Day Chunk Timeseries file on R2.
+   * If the accumulated observations span >= 7 days, complete the chunk file
+   * (e.g. 7d_{start}_{end}.json) and start a fresh 7-day chunk!
    */
-  async syncStation(stationRecord: typeof stations.$inferSelect): Promise<boolean> {
-    const sourceId = stationRecord.sourceStationId || stationRecord.id;
+  private async append7DayChunkHistory(
+    basinSlug: string,
+    stationId: string,
+    stationType: "rainfall" | "water_level",
+    newObservations: Array<{ timestamp: string; stage?: number | null; discharge?: number | null; rainfall?: number | null }>
+  ) {
+    if (newObservations.length === 0) return;
 
-    if (stationRecord.type === "rainfall") {
-      const rainRes = await this.fetchRainfallGraph(sourceId);
-      if (!rainRes || !rainRes.data || rainRes.data.length === 0) {
-        return false;
+    const folderPrefix =
+      stationType === "rainfall"
+        ? `rainfall_station/${basinSlug}/${stationId}`
+        : `waterlevel_station/${basinSlug}/${stationId}`;
+
+    const active7dPath = `${folderPrefix}/history/latest-7d.json`;
+    const existing = (await r2Storage.getJson(active7dPath)) as {
+      stationId: string;
+      observations: Array<{ timestamp: string; stage?: number | null; discharge?: number | null; rainfall?: number | null }>;
+      startDate?: string;
+    } | null;
+
+    // Merge and deduplicate by timestamp
+    const obsMap = new Map<string, any>();
+    if (existing && Array.isArray(existing.observations)) {
+      for (const o of existing.observations) {
+        obsMap.set(o.timestamp, o);
       }
+    }
+    for (const o of newObservations) {
+      obsMap.set(o.timestamp, o);
+    }
 
-      // Filter valid entries with value
-      const items = rainRes.data.filter((d) => d.value !== null);
-      if (items.length === 0) return false;
+    const merged = Array.from(obsMap.values()).sort(
+      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
 
-      const latestItem = items[items.length - 1];
-      const latestTime = new Date(latestItem.datetime);
-      const rain1h = latestItem.value || 0;
+    const minTime = new Date(merged[0].timestamp).getTime();
+    const maxTime = new Date(merged[merged.length - 1].timestamp).getTime();
+    const spanDays = (maxTime - minTime) / (1000 * 60 * 60 * 24);
 
-      // Calculate 3h, 6h, 24h rainfall sums
-      const last3Items = items.slice(-3);
-      const rain3h = last3Items.reduce((acc, curr) => acc + (curr.value || 0), 0);
+    const startDateStr = new Date(minTime).toISOString().split("T")[0];
+    const endDateStr = new Date(maxTime).toISOString().split("T")[0];
 
-      const last6Items = items.slice(-6);
-      const rain6h = last6Items.reduce((acc, curr) => acc + (curr.value || 0), 0);
+    // Check if 7 days are complete
+    if (spanDays >= 7) {
+      // 1. Archive the completed 7-day file
+      const completedPath = `${folderPrefix}/history/7d_${startDateStr}_to_${endDateStr}.json`;
+      const completedPayload = {
+        schemaVersion: "1.0",
+        stationId,
+        basin: basinSlug,
+        type: stationType,
+        startDate: startDateStr,
+        endDate: endDateStr,
+        totalObservations: merged.length,
+        observations: merged,
+        isCompleted: true,
+        finalizedAt: new Date().toISOString(),
+      };
+      await r2Storage.putJson(completedPath, completedPayload, "public, max-age=604800, s-maxage=604800");
 
-      const last24Items = items.slice(-24);
-      const rain24h = last24Items.reduce((acc, curr) => acc + (curr.value || 0), 0);
+      // 2. Reset latest-7d.json with only the newest day's observations for the new 7-day cycle
+      const recentDayObs = merged.filter(
+        (o) => maxTime - new Date(o.timestamp).getTime() <= 24 * 60 * 60 * 1000
+      );
+      const newCyclePayload = {
+        schemaVersion: "1.0",
+        stationId,
+        basin: basinSlug,
+        type: stationType,
+        startDate: new Date(recentDayObs[0]?.timestamp || maxTime).toISOString().split("T")[0],
+        totalObservations: recentDayObs.length,
+        observations: recentDayObs,
+        isCompleted: false,
+        updatedAt: new Date().toISOString(),
+      };
+      await r2Storage.putJson(active7dPath, newCyclePayload, "public, max-age=180, s-maxage=180");
+    } else {
+      // Still accumulating in current 7-day chunk
+      const payload = {
+        schemaVersion: "1.0",
+        stationId,
+        basin: basinSlug,
+        type: stationType,
+        startDate: startDateStr,
+        totalObservations: merged.length,
+        observations: merged,
+        isCompleted: false,
+        updatedAt: new Date().toISOString(),
+      };
+      await r2Storage.putJson(active7dPath, payload, "public, max-age=180, s-maxage=180");
+    }
+  }
 
-      // Situation status & Alert Reason thresholds (Flash Rain & Intensity criteria)
-      let situationStatus: SituationStatus = "normal";
-      let alertReasonTh: string | null = null;
-      let alertReasonEn: string | null = null;
+  /**
+   * Sync single rainfall station:
+   * 1. Fetches day-by-day telemetry
+   * 2. Overwrites current.json directly on R2 (Replace)
+   * 3. Appends/Rotates 7-day timeseries on R2
+   */
+  async syncRainfallStation(
+    st: typeof rainfallStations.$inferSelect,
+    basinSlug: string
+  ): Promise<{ ok: boolean; latestRain?: { rain1h: number; rain3h: number; rain24h: number; lat: number; nameTh: string; nameEn: string } }> {
+    const rainRes = await this.fetchRainfallGraph(st.id);
+    if (!rainRes || !rainRes.data || rainRes.data.length === 0) {
+      return { ok: false };
+    }
 
-      // 1. Critical Rule (Flash flood / Extreme heavy rain)
-      if (
-        rain24h >= 150.0 ||
-        rain3h >= 100.0 ||
-        (rain24h >= 100.0 && (rain3h >= 30.0 || rain1h >= 30.0))
-      ) {
-        situationStatus = "critical";
-        alertReasonTh = `ฝนตกหนักมากสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (3 ชม. ${rain3h.toFixed(1)} มม., 1 ชม. ${rain1h.toFixed(1)} มม.) เสี่ยงน้ำท่วมฉับพลันและน้ำป่าไหลหลาก`;
-        alertReasonEn = `Critical heavy rainfall: 24h ${rain24h.toFixed(1)} mm, 3h ${rain3h.toFixed(1)} mm. High flash flood risk.`;
-      }
-      // 2. Warning Rule (Heavy rain / Significant accumulation)
-      else if (
-        rain24h >= 100.0 ||
-        (rain24h >= 90.0 && rain3h >= 20.0) ||
-        rain3h >= 50.0 ||
-        rain1h >= 30.0
-      ) {
-        situationStatus = "warning";
-        alertReasonTh = `ฝนตกหนักสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (3 ชม. ${rain3h.toFixed(1)} มม., 1 ชม. ${rain1h.toFixed(1)} มม.) โปรดเฝ้าระวังน้ำท่วมขังและน้ำหลาก`;
-        alertReasonEn = `Heavy rainfall alert: 24h ${rain24h.toFixed(1)} mm, 3h ${rain3h.toFixed(1)} mm. Flood watch advised.`;
-      }
-      // 3. Watch Rule (Moderate-heavy rain)
-      else if (rain24h >= 35.0 || rain3h >= 20.0 || rain1h >= 15.0) {
-        situationStatus = "watch";
-        alertReasonTh = `มีฝนตกต่อเนื่องสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (3 ชม. ${rain3h.toFixed(1)} มม.)`;
-        alertReasonEn = `Continuous moderate-to-heavy rain: 24h ${rain24h.toFixed(1)} mm.`;
-      }
+    const items = rainRes.data.filter((d) => d.value !== null);
+    if (items.length === 0) return { ok: false };
 
-      const freshness = this.calculateFreshness(latestTime);
+    const latestItem = items[items.length - 1];
+    const latestTime = new Date(latestItem.datetime);
+    const rain1h = latestItem.value || 0;
 
-      // Upsert telemetry_latest
-      await db
-        .insert(telemetryLatest)
-        .values({
-          stationId: stationRecord.id,
-          basinId: stationRecord.basinId,
+    const last3Items = items.slice(-3);
+    const rain3h = last3Items.reduce((acc, curr) => acc + (curr.value || 0), 0);
+
+    const last6Items = items.slice(-6);
+    const rain6h = last6Items.reduce((acc, curr) => acc + (curr.value || 0), 0);
+
+    const last24Items = items.slice(-24);
+    const rain24h = last24Items.reduce((acc, curr) => acc + (curr.value || 0), 0);
+
+    let situationStatus: SituationStatus = "normal";
+    let alertReasonTh: string | null = null;
+    let alertReasonEn: string | null = null;
+
+    if (rain24h >= 150.0 || rain3h >= 100.0 || (rain24h >= 100.0 && (rain3h >= 30.0 || rain1h >= 30.0))) {
+      situationStatus = "critical";
+      alertReasonTh = `ฝนตกหนักมากสะสม 24 ชม. ${rain24h.toFixed(1)} มม. เสี่ยงน้ำท่วมฉับพลันและน้ำป่าไหลหลาก`;
+      alertReasonEn = `Critical heavy rainfall: 24h ${rain24h.toFixed(1)} mm. High flash flood risk.`;
+    } else if (rain24h >= 100.0 || (rain24h >= 90.0 && rain3h >= 20.0) || rain3h >= 50.0 || rain1h >= 30.0) {
+      situationStatus = "warning";
+      alertReasonTh = `ฝนตกหนักสะสม 24 ชม. ${rain24h.toFixed(1)} มม. โปรดเฝ้าระวังน้ำท่วมขังและน้ำหลาก`;
+      alertReasonEn = `Heavy rainfall alert: 24h ${rain24h.toFixed(1)} mm. Flood watch advised.`;
+    } else if (rain24h >= 35.0 || rain3h >= 20.0 || rain1h >= 15.0) {
+      situationStatus = "watch";
+      alertReasonTh = `มีฝนตกต่อเนื่องสะสม 24 ชม. ${rain24h.toFixed(1)} มม.`;
+      alertReasonEn = `Continuous moderate-to-heavy rain: 24h ${rain24h.toFixed(1)} mm.`;
+    }
+
+    const freshness = this.calculateFreshness(latestTime);
+
+    // 1. Overwrite / Replace current.json directly on R2
+    const currentPayload: StationCurrentDataset = {
+      schemaVersion: "1.0",
+      datasetVersion: new Date().toISOString(),
+      stationId: st.id,
+      basin: basinSlug,
+      type: "rainfall",
+      timestamp: latestTime.toISOString(),
+      status: situationStatus,
+      freshness,
+      alertReason: alertReasonTh ? { th: alertReasonTh, en: alertReasonEn || "" } : undefined,
+      isUpstreamAlert: false,
+      rainfall: {
+        value1h: rain1h,
+        value3h: rain3h,
+        value6h: rain6h,
+        value24h: rain24h,
+        valueToday: rain24h * 0.7,
+        intensity: this.calculateRainIntensity(rain24h),
+      },
+      updatedAt: new Date().toISOString(),
+    };
+    const currentPath = `rainfall_station/${basinSlug}/${st.id}/current.json`;
+    await r2Storage.putJson(currentPath, currentPayload, "public, max-age=60, s-maxage=60");
+
+    // 2. Append to 7-Day Chunk Timeseries on R2
+    const observations = items.map((i) => ({
+      timestamp: new Date(i.datetime).toISOString(),
+      rainfall: i.value,
+    }));
+    await this.append7DayChunkHistory(basinSlug, st.id, "rainfall", observations);
+
+    // 3. Update telemetry_latest in DB (Secondary Cache for Fast Queries)
+    await db
+      .insert(telemetryLatest)
+      .values({
+        stationId: st.id,
+        basinId: st.basinId,
+        timestamp: latestTime,
+        rainfall1h: rain1h,
+        rainfall3h: rain3h,
+        rainfall6h: rain6h,
+        rainfall24h: rain24h,
+        rainfallToday: rain24h * 0.7,
+        situationStatus,
+        freshnessStatus: freshness,
+        alertReasonTh,
+        alertReasonEn,
+        isUpstreamAlert: "false",
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: telemetryLatest.stationId,
+        set: {
           timestamp: latestTime,
           rainfall1h: rain1h,
           rainfall3h: rain3h,
           rainfall6h: rain6h,
           rainfall24h: rain24h,
-          rainfallToday: rain24h * 0.7, // approximate
+          rainfallToday: rain24h * 0.7,
           situationStatus,
           freshnessStatus: freshness,
           alertReasonTh,
           alertReasonEn,
-          isUpstreamAlert: "false",
           updatedAt: new Date(),
-        })
-        .onConflictDoUpdate({
-          target: telemetryLatest.stationId,
-          set: {
-            timestamp: latestTime,
-            rainfall1h: rain1h,
-            rainfall3h: rain3h,
-            rainfall6h: rain6h,
-            rainfall24h: rain24h,
-            rainfallToday: rain24h * 0.7,
-            situationStatus,
-            freshnessStatus: freshness,
-            alertReasonTh,
-            alertReasonEn,
-            isUpstreamAlert: "false",
-            updatedAt: new Date(),
-          },
-        });
+        },
+      });
 
-      return true;
-    } else {
-      // Water level station
-      const wlRes = await this.fetchWaterLevelGraph(sourceId);
-      if (!wlRes || !wlRes.data || wlRes.data.length === 0) {
-        return false;
+    return {
+      ok: true,
+      latestRain: {
+        rain1h,
+        rain3h,
+        rain24h,
+        lat: st.lat,
+        nameTh: st.nameTh,
+        nameEn: st.nameEn,
+      },
+    };
+  }
+
+  /**
+   * Sync single water level station:
+   * 1. Fetches day-by-day telemetry
+   * 2. Checks upstream rainfall correlation from in-memory rain map
+   * 3. Overwrites current.json directly on R2 (Replace)
+   * 4. Appends/Rotates 7-day timeseries on R2
+   */
+  async syncWaterlevelStation(
+    st: typeof waterlevelStations.$inferSelect,
+    basinSlug: string,
+    basinRainMap: Array<{ rain1h: number; rain3h: number; rain24h: number; lat: number; nameTh: string; nameEn: string }>
+  ): Promise<boolean> {
+    const wlRes = await this.fetchWaterLevelGraph(st.id);
+    if (!wlRes || !wlRes.data || wlRes.data.length === 0) {
+      return false;
+    }
+
+    const mainData = wlRes.data[0];
+    const validPoints = (mainData.data || []).filter((d) => d.value !== null);
+    if (validPoints.length === 0) return false;
+
+    const latestPoint = validPoints[validPoints.length - 1];
+    const latestTime = new Date(latestPoint.datetime);
+    const stage = latestPoint.value;
+    const discharge = latestPoint.discharge || null;
+
+    const bankLevel = mainData.minBank || st.minBank;
+    const criticalLevel = mainData.criticalLevel || bankLevel;
+    const warningLevel = mainData.warningLevel || (bankLevel ? bankLevel * 0.85 : null);
+    const watchLevel = bankLevel ? bankLevel * 0.7 : null;
+
+    let situationStatus: SituationStatus = "normal";
+    if (stage !== null) {
+      if (criticalLevel && stage >= criticalLevel) {
+        situationStatus = "critical";
+      } else if (warningLevel && stage >= warningLevel) {
+        situationStatus = "warning";
+      } else if (watchLevel && stage >= watchLevel) {
+        situationStatus = "watch";
       }
+    }
 
-      const mainData = wlRes.data[0];
-      const validPoints = (mainData.data || []).filter((d) => d.value !== null);
-      if (validPoints.length === 0) return false;
+    let storagePercent: number | null = null;
+    if (bankLevel && stage !== null) {
+      storagePercent = Math.min(120, Math.max(0, Math.round((stage / bankLevel) * 100)));
+    }
 
-      const latestPoint = validPoints[validPoints.length - 1];
-      const latestTime = new Date(latestPoint.datetime);
-      const stage = latestPoint.value;
-      const discharge = latestPoint.discharge || null;
+    // Upstream Rainfall Correlation (In-Memory from basin rain stations)
+    let isUpstreamAlert = false;
+    let upstreamAlertTh: string | null = null;
+    let upstreamAlertEn: string | null = null;
 
-      // Extract thresholds from API or Station Master, with standard hydrological fallbacks (§2.2)
-      const bankLevel = mainData.minBank || stationRecord.bankLevelMsl;
-      const criticalLevel = mainData.criticalLevel || stationRecord.criticalLevelMsl || bankLevel;
-      const warningLevel =
-        mainData.warningLevel || stationRecord.warningLevelMsl || (bankLevel ? bankLevel * 0.85 : null);
-      const watchLevel = bankLevel ? bankLevel * 0.7 : null;
+    const heavyUpstream = basinRainMap.filter((r) => {
+      const isUpstreamReach = r.lat >= st.lat - 0.05;
+      return isUpstreamReach && (r.rain24h >= 80.0 || r.rain3h >= 20.0);
+    });
 
-      // Determine situation status from local water level stage
-      let situationStatus: SituationStatus = "normal";
-      if (stage !== null) {
-        if (criticalLevel && stage >= criticalLevel) {
-          situationStatus = "critical";
-        } else if (warningLevel && stage >= warningLevel) {
-          situationStatus = "warning";
-        } else if (watchLevel && stage >= watchLevel) {
-          situationStatus = "watch";
-        }
+    if (heavyUpstream.length > 0) {
+      const topRain = heavyUpstream.sort((a, b) => b.rain24h - a.rain24h)[0];
+      isUpstreamAlert = true;
+      upstreamAlertTh = `ขณะนี้มีฝนตกหนักที่ต้นน้ำ (สถานี ${topRain.nameTh} ฝน 24 ชม. ${topRain.rain24h.toFixed(1)} มม.) โปรดเฝ้าระวังมวลน้ำหลาก`;
+      upstreamAlertEn = `Heavy upstream rainfall at ${topRain.nameEn} (24h: ${topRain.rain24h.toFixed(1)} mm). Watch for downstream runoff.`;
+
+      if (situationStatus === "normal") {
+        situationStatus = topRain.rain24h >= 120.0 ? "warning" : "watch";
       }
+    }
 
-      // Storage percent relative to bank
-      let storagePercent: number | null = null;
-      if (bankLevel && stage !== null) {
-        storagePercent = Math.min(120, Math.max(0, Math.round((stage / bankLevel) * 100)));
+    let alertReasonTh = upstreamAlertTh;
+    let alertReasonEn = upstreamAlertEn;
+
+    if (!alertReasonTh) {
+      if (situationStatus === "critical") {
+        alertReasonTh = `ระดับน้ำล้นตลิ่ง (${stage} ม. / ${storagePercent}% ของความจุตลิ่ง) วิกฤตน้ำท่วม`;
+        alertReasonEn = `River level exceeds bank capacity (${stage} m / ${storagePercent}%). Critical overflow.`;
+      } else if (situationStatus === "warning") {
+        alertReasonTh = `ระดับน้ำใกล้ล้นตลิ่ง (${stage} ม. / ${storagePercent}% ของความจุตลิ่ง) เตือนภัย`;
+        alertReasonEn = `River level near bank capacity (${stage} m / ${storagePercent}%). Warning stage.`;
+      } else if (situationStatus === "watch") {
+        alertReasonTh = `ระดับน้ำขึ้นสูง (${stage} ม. / ${storagePercent}% ของความจุตลิ่ง) เฝ้าระวัง`;
+        alertReasonEn = `Elevated river stage (${stage} m / ${storagePercent}%). Watch criteria.`;
       }
+    }
 
-      // Check Upstream Rainfall Influence across the Basin
-      let isUpstreamAlert = false;
-      let upstreamAlertTh: string | null = null;
-      let upstreamAlertEn: string | null = null;
+    const recentValues = validPoints.slice(-5).map((p) => p.value);
+    const trend = this.calculateTrend(recentValues);
+    const freshness = this.calculateFreshness(latestTime);
 
-      try {
-        const { and } = await import("drizzle-orm");
-        const upstreamRainList = await db
-          .select({
-            id: stations.id,
-            nameTh: stations.nameTh,
-            nameEn: stations.nameEn,
-            lat: stations.lat,
-            rain1h: telemetryLatest.rainfall1h,
-            rain3h: telemetryLatest.rainfall3h,
-            rain24h: telemetryLatest.rainfall24h,
-          })
-          .from(stations)
-          .innerJoin(telemetryLatest, eq(stations.id, telemetryLatest.stationId))
-          .where(
-            and(
-              eq(stations.basinId, stationRecord.basinId),
-              eq(stations.type, "rainfall")
-            )
-          );
+    // 1. Overwrite / Replace current.json directly on R2
+    const currentPayload: StationCurrentDataset = {
+      schemaVersion: "1.0",
+      datasetVersion: new Date().toISOString(),
+      stationId: st.id,
+      basin: basinSlug,
+      type: "water_level",
+      timestamp: latestTime.toISOString(),
+      status: situationStatus,
+      freshness,
+      alertReason: alertReasonTh ? { th: alertReasonTh, en: alertReasonEn || "" } : undefined,
+      isUpstreamAlert,
+      waterLevel: {
+        stage,
+        discharge,
+        waterLevelMsl: stage,
+        storagePercent,
+        trend,
+      },
+      updatedAt: new Date().toISOString(),
+    };
+    const currentPath = `waterlevel_station/${basinSlug}/${st.id}/current.json`;
+    await r2Storage.putJson(currentPath, currentPayload, "public, max-age=60, s-maxage=60");
 
-        // Filter upstream (higher latitude) or severe rainfall stations in basin
-        const heavyUpstream = upstreamRainList.filter((r) => {
-          const isUpstreamReach = r.lat >= stationRecord.lat - 0.05; // Upstream reach
-          const rain24 = r.rain24h || 0;
-          const rain3 = r.rain3h || 0;
-          const rain1 = r.rain1h || 0;
+    // 2. Append to 7-Day Chunk Timeseries on R2
+    const observations = validPoints.map((p) => ({
+      timestamp: new Date(p.datetime).toISOString(),
+      stage: p.value,
+      discharge: p.discharge || null,
+    }));
+    await this.append7DayChunkHistory(basinSlug, st.id, "water_level", observations);
 
-          return (
-            isUpstreamReach &&
-            (rain24 >= 100.0 ||
-              rain3 >= 100.0 ||
-              (rain24 >= 100.0 && (rain3 >= 30.0 || rain1 >= 30.0)) ||
-              (rain24 >= 80.0 && rain3 >= 20.0))
-          );
-        });
-
-        if (heavyUpstream.length > 0) {
-          const topRain = heavyUpstream.sort((a, b) => (b.rain24h || 0) - (a.rain24h || 0))[0];
-          isUpstreamAlert = true;
-          const rain24Str = (topRain.rain24h || 0).toFixed(1);
-          const rain3Str = (topRain.rain3h || 0).toFixed(1);
-
-          // Use model-computed arrival time if available from station metadata / external model
-          let timePhraseTh = "อย่างใกล้ชิด";
-          let timePhraseEn = "closely";
-
-          if (stationRecord.lagTimeHoursMin && stationRecord.lagTimeHoursMax) {
-            timePhraseTh = `ในอีกประมาณ ${stationRecord.lagTimeHoursMin} - ${stationRecord.lagTimeHoursMax} ชั่วโมง`;
-            timePhraseEn = `in approximately ${stationRecord.lagTimeHoursMin} - ${stationRecord.lagTimeHoursMax} hours`;
-          } else if (stationRecord.lagTimeHours) {
-            timePhraseTh = `ในอีกประมาณ ${stationRecord.lagTimeHours} ชั่วโมง`;
-            timePhraseEn = `in approximately ${stationRecord.lagTimeHours} hours`;
-          }
-
-          upstreamAlertTh = `ขณะนี้มีฝนตกหนักที่ต้นน้ำ (สถานี ${topRain.nameTh} ฝน 24 ชม. ${rain24Str} มม., 3 ชม. ${rain3Str} มม.) โปรดเฝ้าระวังระดับน้ำและมวลน้ำหลากที่จะไหลลงสู่พื้นที่นี้ ${timePhraseTh}`;
-          upstreamAlertEn = `Heavy upstream rainfall at ${topRain.nameEn} (24h: ${rain24Str} mm, 3h: ${rain3Str} mm). Watch for downstream flood runoff ${timePhraseEn}.`;
-
-          // Escalate situation status if upstream has extreme rain
-          if (situationStatus === "normal") {
-            situationStatus = (topRain.rain24h || 0) >= 120.0 || (topRain.rain3h || 0) >= 60.0 ? "warning" : "watch";
-          } else if (situationStatus === "watch") {
-            situationStatus = "warning";
-          }
-        }
-      } catch (err) {
-        console.warn("Could not evaluate upstream rain correlation:", err);
-      }
-
-      // Combine alert reasons
-      let alertReasonTh = upstreamAlertTh;
-      let alertReasonEn = upstreamAlertEn;
-
-      if (!alertReasonTh) {
-        if (situationStatus === "critical") {
-          alertReasonTh = `ระดับน้ำล้นตลิ่ง (${stage} ม. / ${storagePercent}% ของความจุตลิ่ง) วิกฤตน้ำท่วม`;
-          alertReasonEn = `River level exceeds bank capacity (${stage} m / ${storagePercent}%). Critical overflow.`;
-        } else if (situationStatus === "warning") {
-          alertReasonTh = `ระดับน้ำใกล้ล้นตลิ่ง (${stage} ม. / ${storagePercent}% ของความจุตลิ่ง) เตือนภัย`;
-          alertReasonEn = `River level near bank capacity (${stage} m / ${storagePercent}%). Warning stage.`;
-        } else if (situationStatus === "watch") {
-          alertReasonTh = `ระดับน้ำขึ้นสูง (${stage} ม. / ${storagePercent}% ของความจุตลิ่ง) เฝ้าระวัง`;
-          alertReasonEn = `Elevated river stage (${stage} m / ${storagePercent}%). Watch criteria.`;
-        }
-      }
-
-      // Determine trend
-      const recentValues = validPoints.slice(-5).map((p) => p.value);
-      const trend = this.calculateTrend(recentValues);
-      const freshness = this.calculateFreshness(latestTime);
-
-      // Upsert telemetry_latest
-      await db
-        .insert(telemetryLatest)
-        .values({
-          stationId: stationRecord.id,
-          basinId: stationRecord.basinId,
+    // 3. Update telemetry_latest in DB (Secondary Cache for Fast Queries)
+    await db
+      .insert(telemetryLatest)
+      .values({
+        stationId: st.id,
+        basinId: st.basinId,
+        timestamp: latestTime,
+        stage,
+        discharge,
+        waterLevelMsl: stage,
+        storagePercent,
+        trend,
+        situationStatus,
+        freshnessStatus: freshness,
+        alertReasonTh,
+        alertReasonEn,
+        isUpstreamAlert: isUpstreamAlert ? "true" : "false",
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: telemetryLatest.stationId,
+        set: {
           timestamp: latestTime,
           stage,
           discharge,
@@ -442,77 +560,94 @@ export class ThaiWaterIngestionService {
           alertReasonTh,
           alertReasonEn,
           isUpstreamAlert: isUpstreamAlert ? "true" : "false",
-          estimatedArrivalHoursMin: stationRecord.lagTimeHoursMin || null,
-          estimatedArrivalHoursMax: stationRecord.lagTimeHoursMax || null,
           updatedAt: new Date(),
-        })
-        .onConflictDoUpdate({
-          target: telemetryLatest.stationId,
-          set: {
-            timestamp: latestTime,
-            stage,
-            discharge,
-            waterLevelMsl: stage,
-            storagePercent,
-            trend,
-            situationStatus,
-            freshnessStatus: freshness,
-            alertReasonTh,
-            alertReasonEn,
-            isUpstreamAlert: isUpstreamAlert ? "true" : "false",
-            estimatedArrivalHoursMin: stationRecord.lagTimeHoursMin || null,
-            estimatedArrivalHoursMax: stationRecord.lagTimeHoursMax || null,
-            updatedAt: new Date(),
-          },
-        });
+        },
+      });
 
-      return true;
-    }
+    return true;
   }
 
   /**
-   * Sync telemetry for all active stations (optionally filtered by basin)
-   * Syncs rainfall stations first so that water level stations can correlate upstream rain immediately.
+   * Sync telemetry across active basins (or target basin)
+   * Processes Rainfall stations first to enable in-memory upstream correlation,
+   * then processes Waterlevel stations, and finishes by publishing overview & stations datasets on R2.
    */
-  async syncAllTelemetry(targetBasinId?: string): Promise<{
+  async syncAllTelemetry(targetBasinSlug?: string): Promise<{
     success: boolean;
     total: number;
     synced: number;
     failed: number;
     errors: any[];
   }> {
-    const allStations = targetBasinId
-      ? await db.select().from(stations).where(eq(stations.basinId, targetBasinId))
-      : await db.select().from(stations);
+    // Only process basins where is_active = true
+    const activeBasins = targetBasinSlug
+      ? await db.select().from(basins).where(eq(basins.slug, targetBasinSlug))
+      : await db.select().from(basins).where(eq(basins.isActive, true));
 
-    // Prioritize rainfall stations first
-    const sortedStations = [...allStations].sort((a, b) => {
-      if (a.type === "rainfall" && b.type !== "rainfall") return -1;
-      if (a.type !== "rainfall" && b.type === "rainfall") return 1;
-      return 0;
-    });
-
+    let totalStations = 0;
     let synced = 0;
     let failed = 0;
     const errors: any[] = [];
 
-    for (const st of sortedStations) {
-      try {
-        const ok = await this.syncStation(st);
-        if (ok) {
-          synced++;
-        } else {
+    for (const b of activeBasins) {
+      const rainList = await db.select().from(rainfallStations).where(eq(rainfallStations.basinId, b.id));
+      const waterList = await db.select().from(waterlevelStations).where(eq(waterlevelStations.basinId, b.id));
+      totalStations += rainList.length + waterList.length;
+
+      const basinRainObservations: Array<{ rain1h: number; rain3h: number; rain24h: number; lat: number; nameTh: string; nameEn: string }> = [];
+
+      // 1. Sync Rainfall Stations for this basin
+      for (const st of rainList) {
+        try {
+          const res = await this.syncRainfallStation(st, b.slug);
+          if (res.ok) {
+            synced++;
+            if (res.latestRain) {
+              basinRainObservations.push(res.latestRain);
+            }
+          } else {
+            failed++;
+          }
+        } catch (err: any) {
           failed++;
+          errors.push({ stationId: st.id, error: err.message });
         }
-      } catch (err: any) {
-        failed++;
-        errors.push({ stationId: st.id, error: err.message });
       }
+
+      // 2. Sync Waterlevel Stations for this basin
+      for (const st of waterList) {
+        try {
+          const ok = await this.syncWaterlevelStation(st, b.slug, basinRainObservations);
+          if (ok) {
+            synced++;
+          } else {
+            failed++;
+          }
+        } catch (err: any) {
+          failed++;
+          errors.push({ stationId: st.id, error: err.message });
+        }
+      }
+
+      // 3. Auto-publish overview and station snapshots on R2 for this basin
+      try {
+        await r2Publisher.publishBasinStationsList(b.slug);
+        await r2Publisher.publishBasinOverview(b.slug);
+      } catch (pubErr) {
+        console.warn(`⚠️ Warning publishing R2 aggregates for basin ${b.slug}:`, pubErr);
+      }
+    }
+
+    // 4. Update root basins.json
+    try {
+      await r2Publisher.publishBasinsList();
+    } catch (pubErr) {
+      // Continue
     }
 
     return {
       success: true,
-      total: allStations.length,
+      total: totalStations,
       synced,
       failed,
       errors,

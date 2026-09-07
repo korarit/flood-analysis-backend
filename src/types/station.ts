@@ -83,6 +83,14 @@ export interface StationDetailDataset {
       provider: string;
       sourceStationId: string;
     };
+    relationsSummary?: {
+      influencingRainfallCount?: number;
+      streamFallCount?: number;
+      receivingWaterlevelCount?: number;
+      receivingStationIds?: string[];
+      nextStationId?: string | null;
+      streamFallName?: string | null;
+    };
     status: "active" | "inactive" | "unknown";
   };
 }

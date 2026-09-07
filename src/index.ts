@@ -67,6 +67,8 @@ app.get("/r2-static/*", (c) => {
 
 console.log(`🌊 Water Situation Backend running at http://localhost:${env.PORT}`);
 
+export { app };
+
 export default {
   port: env.PORT,
   fetch: app.fetch,

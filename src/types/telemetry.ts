@@ -86,7 +86,12 @@ export interface StationRelationsDataset {
   schemaVersion: string;
   datasetVersion: string;
   stationId: string;
+  stationType?: "water_level" | "rainfall";
   basin: string;
   generatedAt: string;
+  influencingRainfallStations?: any[];
+  streamFall?: any[];
+  downstreamStations?: any[];
+  receivingWaterlevelStations?: any[];
   relations: StationRelationItem[];
 }

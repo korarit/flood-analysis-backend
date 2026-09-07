@@ -1,6 +1,8 @@
-import { eq } from "drizzle-orm";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { and, eq, or } from "drizzle-orm";
 import { db } from "../db";
-import { basins, datasetRegistry, stations, telemetryLatest } from "../db/schema";
+import { basins, datasetRegistry, rainfallStations, stationRelations, telemetryLatest, waterlevelStations } from "../db/schema";
 import {
   BasinOverviewDataset,
   BasinsListDataset,
@@ -67,16 +69,38 @@ export class R2PublisherService {
   }
 
   /**
-   * 4.1 Publish `/basins.json` (หน้ารวมลุ่มน้ำทั้งประเทศ)
+   * Helper to retrieve all stations for a basin (from both waterlevel and rainfall tables)
+   */
+  public async getStationsForBasin(basinId?: string) {
+    const wl = basinId
+      ? await db.select().from(waterlevelStations).where(eq(waterlevelStations.basinId, basinId))
+      : await db.select().from(waterlevelStations);
+
+    const rf = basinId
+      ? await db.select().from(rainfallStations).where(eq(rainfallStations.basinId, basinId))
+      : await db.select().from(rainfallStations);
+
+    return {
+      waterlevel: wl,
+      rainfall: rf,
+      all: [
+        ...wl.map((s) => ({ ...s, type: "water_level" as const })),
+        ...rf.map((s) => ({ ...s, type: "rainfall" as const })),
+      ],
+    };
+  }
+
+  /**
+   * 4.1 Publish `/basins.json` (หน้ารวมลุ่มน้ำทั้งประเทศ - เฉพาะ is_active = true)
    */
   async publishBasinsList(): Promise<{ success: boolean; url: string }> {
-    const allBasins = await db.select().from(basins);
-    const allStations = await db.select().from(stations);
+    const activeBasins = await db.select().from(basins).where(eq(basins.isActive, true));
+    const { all: allStations } = await this.getStationsForBasin();
     const allTele = await db.select().from(telemetryLatest);
 
     const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
 
-    const basinsData = allBasins.map((b) => {
+    const basinsData = activeBasins.map((b) => {
       const bStations = allStations.filter((s) => s.basinId === b.id);
       let overallStatus: SituationStatus = "normal";
 
@@ -127,7 +151,7 @@ export class R2PublisherService {
     const [b] = await db.select().from(basins).where(eq(basins.slug, basinSlug));
     if (!b) return;
 
-    const bStations = await db.select().from(stations).where(eq(stations.basinId, b.id));
+    const { all: bStations, waterlevel: wlStations, rainfall: rfStations } = await this.getStationsForBasin(b.id);
     const allTele = await db.select().from(telemetryLatest).where(eq(telemetryLatest.basinId, b.id));
     const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
 
@@ -140,7 +164,8 @@ export class R2PublisherService {
       name: { th: b.nameTh, en: b.nameEn },
       description: { th: b.descriptionTh || "", en: b.descriptionEn || "" },
       areaKm2: b.areaKm2,
-      boundaryBBox: b.boundaryBBox,
+      boundaryGeojsonPath: b.boundaryGeojsonPath,
+      isActive: b.isActive,
       updatedAt: this.getNowIso(),
     };
     const basinPath = `basin/${b.slug}/basin.json`;
@@ -209,8 +234,8 @@ export class R2PublisherService {
       generatedAt: this.getNowIso(),
       summary: {
         totalStations: bStations.length,
-        waterLevelStations: bStations.filter((s) => s.type === "water_level").length,
-        rainfallStations: bStations.filter((s) => s.type === "rainfall").length,
+        waterLevelStations: wlStations.length,
+        rainfallStations: rfStations.length,
         overallStatus,
         statusSummary,
       },
@@ -235,19 +260,22 @@ export class R2PublisherService {
     const [b] = await db.select().from(basins).where(eq(basins.slug, basinSlug));
     if (!b) return;
 
-    const bStations = await db.select().from(stations).where(eq(stations.basinId, b.id));
+    const { all: bStations } = await this.getStationsForBasin(b.id);
     const allTele = await db.select().from(telemetryLatest).where(eq(telemetryLatest.basinId, b.id));
     const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
 
     const stationItems: StationSnapshotItem[] = bStations.map((st) => {
       const t = teleMap.get(st.id);
+      const isWL = st.type === "water_level";
+      const wlSpecific = isWL ? (st as typeof waterlevelStations.$inferSelect) : null;
+
       return {
         id: st.id,
-        code: st.code || st.id,
+        code: st.oldcode || st.id,
         type: st.type as any,
         name: { th: st.nameTh, en: st.nameEn },
         agency: { th: st.agencyNameTh || "", en: st.agencyNameEn || "" },
-        river: st.riverNameTh ? { th: st.riverNameTh, en: st.riverNameEn || "" } : undefined,
+        river: wlSpecific?.riverName ? { th: wlSpecific.riverName, en: wlSpecific.riverName } : undefined,
         lat: st.lat,
         lon: st.lon,
         current: t
@@ -285,22 +313,78 @@ export class R2PublisherService {
       stations: stationItems,
     };
 
-    const path = `basin/${b.slug}/stations.json`;
-    const res = await r2Storage.putJson(path, payload, "public, max-age=180, s-maxage=180");
-    await this.registerDataset(b.id, "stations", path, res.etag);
+    // 1. Publish separated lists: waterlevel_station/{basin}/stations.json & rainfall_station/{basin}/stations.json
+    const wlStationsList = stationItems.filter((s) => s.type === "water_level");
+    const rfStationsList = stationItems.filter((s) => s.type === "rainfall");
+
+    const wlListPath = `waterlevel_station/${b.slug}/stations.json`;
+    await r2Storage.putJson(wlListPath, { ...payload, totalStations: wlStationsList.length, stations: wlStationsList }, "public, max-age=180, s-maxage=180");
+    await this.registerDataset(b.id, "stations_waterlevel", wlListPath);
+
+    const rfListPath = `rainfall_station/${b.slug}/stations.json`;
+    await r2Storage.putJson(rfListPath, { ...payload, totalStations: rfStationsList.length, stations: rfStationsList }, "public, max-age=180, s-maxage=180");
+    await this.registerDataset(b.id, "stations_rainfall", rfListPath);
   }
 
   /**
-   * 4.5, 4.6, 4.7, 4.8 Publish individual station datasets (`detail.json`, `current.json`, `history/{date}.json`, `relations.json`)
+   * 4.5, 4.6, 4.7, 4.8 Publish individual station datasets (`detail.json`, `current.json`, `relations.json`)
+   * Stored under waterlevel_station/{basin}/{id}/ and rainfall_station/{basin}/{id}/
    */
-  async publishStationDatasets(stationId: string): Promise<void> {
-    const [st] = await db.select().from(stations).where(eq(stations.id, stationId));
+  async publishStationDatasets(stationId: string, preloadedTeleMap?: Map<string, any>): Promise<void> {
+    const [wl] = await db.select().from(waterlevelStations).where(eq(waterlevelStations.id, stationId));
+    const [rf] = !wl ? await db.select().from(rainfallStations).where(eq(rainfallStations.id, stationId)) : [undefined];
+    const st = wl || rf;
     if (!st) return;
 
+    const isWL = !!wl;
     const [b] = await db.select().from(basins).where(eq(basins.id, st.basinId));
     const basinSlug = b ? b.slug : st.basinId;
-
     const [t] = await db.select().from(telemetryLatest).where(eq(telemetryLatest.stationId, st.id));
+
+    const folderPrefix = isWL
+      ? `waterlevel_station/${basinSlug}/${st.id}`
+      : `rainfall_station/${basinSlug}/${st.id}`;
+
+    // Extract relations from rawMetadata
+    const metaRelations = (st.rawMetadata as Record<string, any>)?.relations || {};
+    const influencingRainRaw = isWL ? (metaRelations.influencingRainfallStations || []) : [];
+    const streamFallRaw = isWL ? (metaRelations.streamFall || metaRelations.downstreamStations || []) : [];
+    const receivingWlRaw = !isWL ? (metaRelations.receivingWaterlevelStations || []) : [];
+
+    // Pre-fetch all telemetries for quick enrichment if not already supplied
+    const teleMap =
+      preloadedTeleMap ||
+      new Map((await db.select().from(telemetryLatest)).map((t) => [t.stationId, t]));
+
+    // Enrich influencing rainfall stations
+    const enrichedInfluencing = influencingRainRaw.map((inf: any) => {
+      const t = teleMap.get(inf.stationId);
+      return {
+        ...inf,
+        latestRain24h: t?.rainfall24h ?? null,
+        status: (t?.situationStatus as any) || "normal",
+      };
+    });
+
+    // Enrich streamFall stations
+    const enrichedStreamFall = streamFallRaw.map((ds: any) => {
+      const t = teleMap.get(ds.stationId);
+      return {
+        ...ds,
+        latestStage: t?.stage ?? t?.waterLevelMsl ?? null,
+        status: (t?.situationStatus as any) || "normal",
+      };
+    });
+
+    // Enrich receivingWaterlevelStations
+    const enrichedReceiving = receivingWlRaw.map((rec: any) => {
+      const t = teleMap.get(rec.stationId);
+      return {
+        ...rec,
+        latestStage: t?.stage ?? t?.waterLevelMsl ?? null,
+        status: (t?.situationStatus as any) || "normal",
+      };
+    });
 
     // 1. detail.json
     const detailPayload: StationDetailDataset = {
@@ -309,121 +393,76 @@ export class R2PublisherService {
       generatedAt: this.getNowIso(),
       station: {
         id: st.id,
-        code: st.code || st.id,
+        code: st.oldcode || st.id,
         basin: basinSlug,
-        type: st.type as any,
+        type: isWL ? "water_level" : "rainfall",
         name: { th: st.nameTh, en: st.nameEn },
-        address: { th: st.addressTh || "", en: st.addressEn || "" },
+        address: {
+          th: `${st.tumbonNameTh || ""} ${st.amphoeNameTh || ""} ${st.provinceNameTh || ""}`.trim(),
+          en: `${st.tumbonNameEn || ""} ${st.amphoeNameEn || ""} ${st.provinceNameEn || ""}`.trim(),
+        },
         agency: { th: st.agencyNameTh || "", en: st.agencyNameEn || "" },
-        river: st.riverNameTh ? { th: st.riverNameTh, en: st.riverNameEn || "" } : undefined,
+        river: isWL && (st as typeof waterlevelStations.$inferSelect).riverName
+          ? { th: (st as typeof waterlevelStations.$inferSelect).riverName!, en: (st as typeof waterlevelStations.$inferSelect).riverName! }
+          : undefined,
         location: {
           lat: st.lat,
           lon: st.lon,
-          groundLevelMsl: st.groundLevelMsl,
-          bankLevelMsl: st.bankLevelMsl,
-          warningLevelMsl: st.warningLevelMsl,
-          criticalLevelMsl: st.criticalLevelMsl,
+          groundLevelMsl: isWL ? (st as typeof waterlevelStations.$inferSelect).groundLevel : null,
+          bankLevelMsl: isWL ? (st as typeof waterlevelStations.$inferSelect).minBank : null,
+          warningLevelMsl: isWL && (st as typeof waterlevelStations.$inferSelect).minBank ? (st as typeof waterlevelStations.$inferSelect).minBank! * 0.85 : null,
+          criticalLevelMsl: isWL ? (st as typeof waterlevelStations.$inferSelect).minBank : null,
         },
         thresholds: {
-          bankLevelMsl: st.bankLevelMsl,
-          warningLevelMsl: st.warningLevelMsl,
-          criticalLevelMsl: st.criticalLevelMsl,
-          warningRain24h: st.warningRain24h,
-          criticalRain24h: st.criticalRain24h,
+          bankLevelMsl: wl ? wl.minBank : null,
+          warningLevelMsl: wl && wl.minBank ? wl.minBank * 0.85 : null,
+          criticalLevelMsl: wl ? wl.minBank : null,
+          warningRain24h: rf ? rf.warningRain24h : null,
+          criticalRain24h: rf ? rf.criticalRain24h : null,
         },
+        relationsSummary: isWL
+          ? {
+              influencingRainfallCount: influencingRainRaw.length,
+              streamFallCount: streamFallRaw.length,
+              nextStationId: streamFallRaw[0]?.stationId || null,
+              streamFallName: streamFallRaw[0]?.stationName || null,
+            }
+          : {
+              receivingWaterlevelCount: receivingWlRaw.length,
+              receivingStationIds: receivingWlRaw.map((r: any) => r.stationId),
+            },
         source: {
-          provider: st.source || "thaiwater",
-          sourceStationId: st.sourceStationId || st.id,
+          provider: "thaiwater",
+          sourceStationId: st.id,
         },
         status: (st.status as any) || "active",
       },
     };
-    const detailPath = `basin/${basinSlug}/stations/${st.id}/detail.json`;
+    const detailPath = `${folderPrefix}/detail.json`;
     const dRes = await r2Storage.putJson(detailPath, detailPayload, "public, max-age=86400, s-maxage=86400");
-    await this.registerDataset(st.basinId, "station_detail", detailPath, dRes.etag);
+    await this.registerDataset(st.basinId, isWL ? "waterlevel_detail" : "rainfall_detail", detailPath, dRes.etag);
 
-    // 2. current.json
-    const currentPayload: StationCurrentDataset = {
-      schemaVersion: this.schemaVersion,
-      datasetVersion: this.getNowIso(),
-      stationId: st.id,
-      basin: basinSlug,
-      type: st.type as any,
-      timestamp: t?.timestamp?.toISOString() || this.getNowIso(),
-      status: (t?.situationStatus as any) || "normal",
-      freshness: (t?.freshnessStatus as any) || "fresh",
-      alertReason: t?.alertReasonTh ? { th: t.alertReasonTh, en: t.alertReasonEn || "" } : undefined,
-      isUpstreamAlert: t?.isUpstreamAlert === "true",
-      waterLevel:
-        st.type === "water_level"
-          ? {
-              stage: t?.stage || null,
-              discharge: t?.discharge || null,
-              waterLevelMsl: t?.waterLevelMsl || null,
-              storagePercent: t?.storagePercent || null,
-              trend: (t?.trend as any) || "steady",
-            }
-          : undefined,
-      rainfall:
-        st.type === "rainfall"
-          ? {
-              value1h: t?.rainfall1h || null,
-              value3h: t?.rainfall3h || null,
-              value6h: t?.rainfall6h || null,
-              value24h: t?.rainfall24h || null,
-              valueToday: t?.rainfallToday || null,
-              intensity: t?.rainfall24h ? (t.rainfall24h > 35 ? "heavy" : "moderate") : "light",
-            }
-          : undefined,
-      updatedAt: this.getNowIso(),
-    };
-    const currentPath = `basin/${basinSlug}/stations/${st.id}/current.json`;
-    const cRes = await r2Storage.putJson(currentPath, currentPayload, "public, max-age=60, s-maxage=60");
-    await this.registerDataset(st.basinId, "current", currentPath, cRes.etag);
-
-    // 3. history/{date}.json (Today's snapshot)
-    const today = this.getTodayDateString();
-    const historyPath = `basin/${basinSlug}/stations/${st.id}/history/${today}.json`;
-    const historyPayload = {
-      schemaVersion: this.schemaVersion,
-      datasetVersion: this.getNowIso(),
-      stationId: st.id,
-      basin: basinSlug,
-      type: st.type,
-      date: today,
-      generatedAt: this.getNowIso(),
-      observations: [
-        {
-          timestamp: t?.timestamp?.toISOString() || this.getNowIso(),
-          stage: t?.stage || null,
-          discharge: t?.discharge || null,
-          value: t?.rainfall1h || null,
-          status: "valid",
-        },
-      ],
-    };
-    const hRes = await r2Storage.putJson(historyPath, historyPayload, "public, max-age=600, s-maxage=600");
-    await this.registerDataset(st.basinId, "history", historyPath, hRes.etag);
-
-    // 4. relations.json
-    const relPath = `basin/${basinSlug}/stations/${st.id}/relations.json`;
-    const { stationRelations } = await import("../db/schema");
+    // 2. relations.json
+    const relPath = `${folderPrefix}/relations.json`;
     const dbRelations = await db
       .select()
       .from(stationRelations)
-      .where(eq(stationRelations.stationId, st.id));
+      .where(or(eq(stationRelations.stationId, st.id), eq(stationRelations.targetStationId, st.id)));
 
     const relationItems: StationRelationItem[] = [];
 
     for (const rel of dbRelations) {
-      const [targetStation] = await db.select().from(stations).where(eq(stations.id, rel.targetStationId));
-      if (!targetStation) continue;
-      const [targetTele] = await db
-        .select()
-        .from(telemetryLatest)
-        .where(eq(telemetryLatest.stationId, targetStation.id));
+      const isTarget = rel.stationId === st.id;
+      const otherId = isTarget ? rel.targetStationId : rel.stationId;
 
-      const isTargetWater = targetStation.type === "water_level";
+      const [otherWL] = await db.select().from(waterlevelStations).where(eq(waterlevelStations.id, otherId));
+      const [otherRF] = !otherWL ? await db.select().from(rainfallStations).where(eq(rainfallStations.id, otherId)) : [undefined];
+      const otherSt = otherWL || otherRF;
+      if (!otherSt) continue;
+
+      const targetTele = teleMap.get(otherId);
+
+      const isTargetWater = !!otherWL;
       let latestValue = "-";
       if (targetTele) {
         latestValue = isTargetWater
@@ -433,17 +472,17 @@ export class R2PublisherService {
 
       relationItems.push({
         type: rel.relationType as any,
-        stationId: rel.targetStationId,
-        targetStationId: rel.targetStationId,
-        name: { th: targetStation.nameTh, en: targetStation.nameEn },
-        targetStationName: { th: targetStation.nameTh, en: targetStation.nameEn },
-        stationType: targetStation.type as any,
+        stationId: otherId,
+        targetStationId: otherId,
+        name: { th: otherSt.nameTh, en: otherSt.nameEn },
+        targetStationName: { th: otherSt.nameTh, en: otherSt.nameEn },
+        stationType: isTargetWater ? "water_level" : "rainfall",
         distanceKm: rel.distanceKm || 0,
         travelTimeHours: rel.travelTimeHours || null,
-        influenceWeightPercent: rel.influenceWeightPercent || null,
+        influenceWeightPercent: null,
         latestValue,
         status: (targetTele?.situationStatus as any) || "normal",
-        isUpstream: rel.isUpstream,
+        isUpstream: rel.relationType === "influencing" || !isTarget,
       });
     }
 
@@ -451,8 +490,13 @@ export class R2PublisherService {
       schemaVersion: this.schemaVersion,
       datasetVersion: this.getNowIso(),
       stationId: st.id,
+      stationType: isWL ? "water_level" : "rainfall",
       basin: basinSlug,
       generatedAt: this.getNowIso(),
+      influencingRainfallStations: isWL ? enrichedInfluencing : undefined,
+      streamFall: isWL ? enrichedStreamFall : undefined,
+      downstreamStations: isWL ? enrichedStreamFall : undefined,
+      receivingWaterlevelStations: !isWL ? enrichedReceiving : undefined,
       relations: relationItems,
     };
     const rRes = await r2Storage.putJson(relPath, relPayload, "public, max-age=180, s-maxage=180");
@@ -460,13 +504,13 @@ export class R2PublisherService {
   }
 
   /**
-   * 4.9 - 4.11 & 5. Spatial layers and reports (`river/chain.json`, `events/feed.json`, `spatial/*.geojson`)
+   * 4.9 - 4.11 Spatial layers and reports (`river/chain.json`, `events/feed.json`, `spatial/*.geojson`)
    */
   async publishSpatialAndReports(basinSlug: string): Promise<void> {
     const [b] = await db.select().from(basins).where(eq(basins.slug, basinSlug));
     if (!b) return;
 
-    const bStations = await db.select().from(stations).where(eq(stations.basinId, b.id));
+    const { all: bStations } = await this.getStationsForBasin(b.id);
     const allTele = await db.select().from(telemetryLatest).where(eq(telemetryLatest.basinId, b.id));
     const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
 
@@ -477,7 +521,7 @@ export class R2PublisherService {
       basin: b.slug,
       river: b.slug,
       generatedAt: this.getNowIso(),
-      stations: ["8892", "Y-0020"],
+      stations: bStations.filter((s) => s.type === "water_level").slice(0, 10).map((s) => s.id),
     };
     await r2Storage.putJson(chainPath, chainPayload, "public, max-age=86400, s-maxage=86400");
 
@@ -529,71 +573,55 @@ export class R2PublisherService {
     };
     await r2Storage.putJson(feedPath, feedPayload, "public, max-age=600, s-maxage=600");
 
-    // 3. /basin/{basin}/report/bulletin-latest.json (LLM / Hydrological Bulletin Synthesis)
-    await llmBulletinService.generateBulletin(b.slug);
+    // 3. /basin/{basin}/report/bulletin-latest.json
+    try {
+      await llmBulletinService.generateBulletin(b.slug);
+    } catch (err) {
+      // LLM bulletin generation is optional
+    }
 
     // 4. spatial/boundary.geojson
     const boundaryPath = `basin/${b.slug}/spatial/boundary.geojson`;
-    const bbox = (b.boundaryBBox as number[]) || [99.45, 16.45, 100.42, 19.12];
-    const boundaryGeoJson = {
-      type: "FeatureCollection",
-      features: [
-        {
-          type: "Feature",
-          properties: {
-            basinId: b.slug,
-            nameTh: b.nameTh,
-            nameEn: b.nameEn,
-            areaKm2: b.areaKm2,
-          },
-          geometry: {
-            type: "Polygon",
-            coordinates: [
-              [
-                [bbox[0], bbox[3]],
-                [bbox[2], bbox[3]],
-                [bbox[2], bbox[1]],
-                [bbox[0], bbox[1]],
-                [bbox[0], bbox[3]],
-              ],
-            ],
-          },
-        },
-      ],
-    };
-    await r2Storage.putJson(boundaryPath, boundaryGeoJson, "public, max-age=604800, s-maxage=604800");
+    const modelGisBoundary = join(process.cwd(), "..", "flood-analysis-model", "dataset", b.slug, "gis", `${b.slug}_boundary.geojson`);
+    let boundaryGeoJson: any = null;
 
-    // 4. spatial/rivers.geojson
+    if (existsSync(modelGisBoundary)) {
+      try {
+        boundaryGeoJson = JSON.parse(readFileSync(modelGisBoundary, "utf-8"));
+      } catch {
+        boundaryGeoJson = null;
+      }
+    }
+
+    if (boundaryGeoJson) {
+      await r2Storage.putJson(boundaryPath, boundaryGeoJson, "public, max-age=604800, s-maxage=604800");
+      if (!b.boundaryGeojsonPath) {
+        await db.update(basins).set({ boundaryGeojsonPath: boundaryPath }).where(eq(basins.id, b.id));
+      }
+    }
+
+    // 5. spatial/rivers.geojson
     const riversPath = `basin/${b.slug}/spatial/rivers.geojson`;
-    const riversGeoJson = {
-      type: "FeatureCollection",
-      features: [
-        {
-          type: "Feature",
-          properties: {
-            riverId: `R-${b.slug.toUpperCase()}-01`,
-            nameTh: `แม่น้ำ${b.nameTh.replace("ลุ่มน้ำ", "")} (สายหลัก)`,
-            nameEn: `${b.nameEn} Main Stream`,
-            order: 1,
-            lengthKm: 735.0,
-          },
-          geometry: {
-            type: "LineString",
-            coordinates: [
-              [bbox[0] + 0.4, bbox[3] - 0.1],
-              [bbox[0] + 0.3, bbox[3] - 0.6],
-              [bbox[0] + 0.25, bbox[1] + 0.8],
-              [bbox[2] - 0.3, bbox[1] + 0.2],
-            ],
-          },
-        },
-      ],
-    };
-    await r2Storage.putJson(riversPath, riversGeoJson, "public, max-age=604800, s-maxage=604800");
+    const modelRiverNetwork = join(process.cwd(), "..", "flood-analysis-model", "dataset", b.slug, "processed", "river_network_main.geojson");
+    const modelOsmWaterways = join(process.cwd(), "..", "flood-analysis-model", "dataset", b.slug, "gis", "osm_waterways.geojson");
+    const realRiverFile = existsSync(modelRiverNetwork) ? modelRiverNetwork : (existsSync(modelOsmWaterways) ? modelOsmWaterways : null);
+
+    let riversGeoJson: any = null;
+    if (realRiverFile) {
+      try {
+        riversGeoJson = JSON.parse(readFileSync(realRiverFile, "utf-8"));
+      } catch {
+        riversGeoJson = null;
+      }
+    }
+
+    if (riversGeoJson) {
+      await r2Storage.putJson(riversPath, riversGeoJson, "public, max-age=604800, s-maxage=604800");
+    }
   }
 
   /**
-   * Full rebuild and publish of ALL public R2 datasets for all basins
+   * Full rebuild and publish of ALL public R2 datasets for active basins
    */
   async rebuildAllDatasets(targetBasinSlug?: string): Promise<{
     success: boolean;
@@ -602,14 +630,17 @@ export class R2PublisherService {
   }> {
     console.log("🚀 Starting Full R2 Public Datasets Rebuild...");
 
-    // 1. Publish root /basins.json
+    // 1. Publish root /basins.json (only active basins)
     await this.publishBasinsList();
 
     const allBasins = targetBasinSlug
       ? await db.select().from(basins).where(eq(basins.slug, targetBasinSlug))
-      : await db.select().from(basins);
+      : await db.select().from(basins).where(eq(basins.isActive, true));
 
     let stationsCount = 0;
+
+    const allTele = await db.select().from(telemetryLatest);
+    const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
 
     for (const b of allBasins) {
       // 2. Publish Basin overview & stations list
@@ -618,11 +649,11 @@ export class R2PublisherService {
       await this.publishSpatialAndReports(b.slug);
 
       // 3. Publish individual stations
-      const bStations = await db.select().from(stations).where(eq(stations.basinId, b.id));
+      const { all: bStations } = await this.getStationsForBasin(b.id);
       stationsCount += bStations.length;
 
       for (const st of bStations) {
-        await this.publishStationDatasets(st.id);
+        await this.publishStationDatasets(st.id, teleMap);
       }
     }
 

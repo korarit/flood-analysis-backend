@@ -1,24 +1,30 @@
 import { Hono } from "hono";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { basins, stations, telemetryLatest } from "../db/schema";
+import { basins, telemetryLatest } from "../db/schema";
 import { BasinDetail, BasinStatusSummary, BasinSummary, SituationStatus } from "../types";
+import { r2Publisher } from "../services/r2PublisherService";
 
 const basinsRouter = new Hono();
 
 /**
  * 6.1 GET /api/basins
- * List all river basins with summary stats
+ * List all river basins with summary stats (supports ?active=true)
  */
 basinsRouter.get("/", async (c) => {
+  const activeOnly = c.req.query("active") === "true";
+
   try {
-    const allBasins = await db.select().from(basins);
-    const allStations = await db.select().from(stations);
+    const allBasins = activeOnly
+      ? await db.select().from(basins).where(eq(basins.isActive, true))
+      : await db.select().from(basins);
+
+    const { all: allStations } = await r2Publisher.getStationsForBasin();
     const allTele = await db.select().from(telemetryLatest);
 
     const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
 
-    const data: BasinSummary[] = allBasins.map((b) => {
+    const data: (BasinSummary & { isActive: boolean })[] = allBasins.map((b) => {
       const bStations = allStations.filter((s) => s.basinId === b.id);
       let overallStatus: SituationStatus = "normal";
 
@@ -43,6 +49,7 @@ basinsRouter.get("/", async (c) => {
         name: { th: b.nameTh, en: b.nameEn },
         totalStations: bStations.length,
         overallStatus,
+        isActive: b.isActive,
         lastUpdated: b.updatedAt.toISOString(),
         areaKm2: b.areaKm2 || undefined,
       };
@@ -88,7 +95,7 @@ basinsRouter.get("/:slug", async (c) => {
       );
     }
 
-    const bStations = await db.select().from(stations).where(eq(stations.basinId, b.id));
+    const { all: bStations, waterlevel: wlStations, rainfall: rfStations } = await r2Publisher.getStationsForBasin(b.id);
     const allTele = await db.select().from(telemetryLatest).where(eq(telemetryLatest.basinId, b.id));
     const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
 
@@ -133,7 +140,7 @@ basinsRouter.get("/:slug", async (c) => {
       heavyRainCount,
     };
 
-    const data: BasinDetail = {
+    const data: BasinDetail & { isActive: boolean } = {
       id: b.id,
       slug: b.slug,
       code: b.code,
@@ -141,11 +148,12 @@ basinsRouter.get("/:slug", async (c) => {
       description: { th: b.descriptionTh || "", en: b.descriptionEn || "" },
       areaKm2: b.areaKm2 || 0,
       totalStations: bStations.length,
-      waterLevelStationsCount: bStations.filter((s) => s.type === "water_level").length,
-      rainfallStationsCount: bStations.filter((s) => s.type === "rainfall").length,
+      waterLevelStationsCount: wlStations.length,
+      rainfallStationsCount: rfStations.length,
       overallStatus,
       statusSummary,
-      boundaryBBox: (b.boundaryBBox as any) || undefined,
+      isActive: b.isActive,
+      boundaryGeojsonPath: b.boundaryGeojsonPath,
       lastUpdated: b.updatedAt.toISOString(),
     };
 
@@ -202,4 +210,3 @@ basinsRouter.get("/:slug/report", async (c) => {
 });
 
 export { basinsRouter };
-

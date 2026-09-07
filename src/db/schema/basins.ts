@@ -1,4 +1,4 @@
-import { doublePrecision, jsonb, pgTable, text, timestamp, varchar } from "drizzle-orm/pg-core";
+import { boolean, doublePrecision, jsonb, pgTable, text, timestamp, varchar } from "drizzle-orm/pg-core";
 
 export const basins = pgTable("basins", {
   id: text("id").primaryKey(), // e.g. 'yom', 'ping', 'wang', 'nan', 'chi', 'mun', 'chao-phraya'
@@ -6,10 +6,13 @@ export const basins = pgTable("basins", {
   code: varchar("code", { length: 16 }).notNull(),
   nameTh: varchar("name_th", { length: 255 }).notNull(),
   nameEn: varchar("name_en", { length: 255 }).notNull(),
+  isActive: boolean("is_active").default(true).notNull(),
   descriptionTh: text("description_th"),
   descriptionEn: text("description_en"),
   areaKm2: doublePrecision("area_km2"),
-  boundaryBBox: jsonb("boundary_bbox"),
+  // Path to boundary GeoJSON on R2 / storage (e.g. 'basin/{slug}/spatial/boundary.geojson').
+  // ค่า null หมายถึงยังไม่ได้ upload ไฟล์ GeoJSON ขอบเขตลุ่มน้ำ
+  boundaryGeojsonPath: text("boundary_geojson_path"),
   status: varchar("status", { length: 32 }).default("active").notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),

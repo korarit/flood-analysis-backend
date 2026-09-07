@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 import OpenAI from "openai";
 import { env } from "../config/env";
 import { db } from "../db";
-import { basins, stations, telemetryLatest } from "../db/schema";
+import { basins, rainfallStations, telemetryLatest, waterlevelStations } from "../db/schema";
 import { LocalizedString, SituationStatus } from "../types";
 import { r2Storage } from "./r2StorageService";
 
@@ -193,16 +193,16 @@ export class LLMBulletinService {
       const dbBasins = await db.select().from(basins).where(eq(basins.slug, basinSlug));
       b = dbBasins[0];
       if (b) {
-        bStations = await db.select().from(stations).where(eq(stations.basinId, b.id));
+        const wl = await db.select().from(waterlevelStations).where(eq(waterlevelStations.basinId, b.id));
+        const rf = await db.select().from(rainfallStations).where(eq(rainfallStations.basinId, b.id));
+        bStations = [...wl, ...rf];
         allTele = await db.select().from(telemetryLatest).where(eq(telemetryLatest.basinId, b.id));
       }
     } catch {
       // Fallback to seed master data
-      const { initialBasins, initialStations } = await import("../db/seed");
+      const { initialBasins } = await import("../db/seed");
       b = initialBasins.find((item) => item.slug === basinSlug);
-      if (b) {
-        bStations = initialStations.filter((item) => item.basinId === b.id);
-      }
+      bStations = [];
     }
 
     if (!b) return null;
@@ -342,9 +342,9 @@ export class LLMBulletinService {
       maxRainStation: string;
       maxStageStation: string;
       maxStoragePercent: number;
-      upstreamStations: typeof stations.$inferSelect[];
-      midstreamStations: typeof stations.$inferSelect[];
-      downstreamStations: typeof stations.$inferSelect[];
+      upstreamStations: any[];
+      midstreamStations: any[];
+      downstreamStations: any[];
       teleMap: Map<string, typeof telemetryLatest.$inferSelect>;
     }
   ): SituationBulletin {
