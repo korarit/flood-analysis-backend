@@ -319,6 +319,34 @@ export class LLMBulletinService {
   }
 
   /**
+   * Generate Bulletin for all active basins (or specified basin)
+   */
+  async generateAllBulletins(targetBasinSlug?: string): Promise<{
+    success: boolean;
+    total: number;
+    generated: number;
+    bulletins: SituationBulletin[];
+  }> {
+    const activeBasins = targetBasinSlug
+      ? await db.select().from(basins).where(eq(basins.slug, targetBasinSlug))
+      : await db.select().from(basins).where(eq(basins.isActive, true));
+
+    const results: SituationBulletin[] = [];
+    for (const b of activeBasins) {
+      console.log(`📝 [LLMBulletin] Generating bulletin for basin: ${b.nameTh} (${b.slug})...`);
+      const bul = await this.generateBulletin(b.slug);
+      if (bul) results.push(bul);
+    }
+
+    return {
+      success: true,
+      total: activeBasins.length,
+      generated: results.length,
+      bulletins: results,
+    };
+  }
+
+  /**
    * Publish Bulletin to R2 object path: `/basin/{slug}/report/bulletin-latest.json`
    */
   private async publishToR2(basinSlug: string, bulletin: SituationBulletin) {

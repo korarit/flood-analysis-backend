@@ -11,6 +11,8 @@
     "sync": "bun src/scripts/syncTelemetry.ts",
     "sync:all": "bun src/scripts/syncTelemetry.ts --full",
     "sync:telemetry": "bun src/scripts/syncTelemetry.ts",
+    "sync:bulletin": "bun src/scripts/syncBulletin.ts",
+    "llm:sync": "bun src/scripts/syncBulletin.ts",
     "scraper": "bun src/scripts/syncTelemetry.ts",
     "import:stations": "bun src/scripts/importResolvedStations.ts",
     "db:generate": "drizzle-kit generate",

@@ -1,0 +1,66 @@
+name: LLM Hydrological Bulletin Generator
+
+on:
+  # 1. Scheduled Ingestion (e.g. Every 2 hours)
+  schedule:
+    - cron: "0 */2 * * *"
+
+  # 2. Manual Trigger from GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      basin:
+        description: "Target Basin (slug or 'all')"
+        required: false
+        default: "all"
+        type: string
+
+jobs:
+  generate-bulletin:
+    name: Generate Hydrological Bulletin
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # Step 1: Checkout repository
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Step 2: Setup Bun Environment
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Step 3: Install Dependencies
+      - name: Install Dependencies
+        run: bun install --frozen-lockfile
+
+      # Step 4: Run LLM Bulletin Generation & Publish to R2
+      - name: Execute LLM Bulletin Sync
+        env:
+          # Database Connection
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+          # Cloudflare R2 Credentials
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || 'flood-analysis-project' }}
+          R2_PUBLIC_BASE_URL: ${{ secrets.R2_PUBLIC_BASE_URL || 'https://pub-6d09ad692430411182c45170ee192a0a.r2.dev' }}
+          R2_CUSTOM_ENDPOINT: ${{ secrets.R2_CUSTOM_ENDPOINT || 'https://c1cb1f0a6c635934ed103363ac3222c0.r2.cloudflarestorage.com' }}
+          R2_LOCAL_FALLBACK: "false"
+
+          # OpenAI / LLM Configuration (Optional: Falls back to Smart Rule-based engine if empty)
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || 'gpt-4o-mini' }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+        run: |
+          TARGET_BASIN="${{ github.event.inputs.basin || 'all' }}"
+          echo "🤖 Starting LLM Hydrological Bulletin Generation..."
+          echo "   Target Basin: $TARGET_BASIN"
+
+          if [ "$TARGET_BASIN" != "all" ]; then
+            bun run llm:sync "$TARGET_BASIN"
+          else
+            bun run llm:sync
+          fi
