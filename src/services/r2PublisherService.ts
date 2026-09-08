@@ -648,11 +648,11 @@ export class R2PublisherService {
       await this.publishBasinStationsList(b.slug);
       await this.publishSpatialAndReports(b.slug);
 
-      // 3. Publish individual stations with controlled concurrency (25 workers)
+      // 3. Publish individual stations with controlled concurrency (50 workers)
       const { all: bStations } = await this.getStationsForBasin(b.id);
       stationsCount += bStations.length;
 
-      const CONCURRENCY = 25;
+      const CONCURRENCY = 50;
       for (let i = 0; i < bStations.length; i += CONCURRENCY) {
         const batch = bStations.slice(i, i + CONCURRENCY);
         await Promise.all(
