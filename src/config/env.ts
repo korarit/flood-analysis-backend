@@ -12,11 +12,12 @@ const envSchema = z.object({
   // External Cron Secret
   CRON_SECRET: z.string().default("water_analysis_cron_secret_key_2026"),
 
-  // ThaiWater Platform API
+  // ThaiWater Platform API Configuration
   THAIWATER_API_BASE_URL: z.string().default("https://twa-api-public.thaiwater.net"),
   THAIWATER_API_KEY: z.string().default("TPSXrHRvTHeVT2Lygq6YeTqqAm4xZ72x"),
   THAIWATER_ORIGIN: z.string().default("https://twa.thaiwater.net"),
   THAIWATER_REFERER: z.string().default("https://twa.thaiwater.net/"),
+  THAIWATER_INGESTION_MODE: z.enum(["bulk", "legacy"]).default("bulk"),
 
   // Cloudflare R2 Object Storage
   R2_ACCOUNT_ID: z.string().optional().default(""),

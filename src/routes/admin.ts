@@ -4,9 +4,11 @@ import { basename, join } from "node:path";
 import { desc, eq, or } from "drizzle-orm";
 import { db } from "../db";
 import { basins, datasetRegistry, ingestionJobs, telemetryLatest } from "../db/schema";
+import { env } from "../config/env";
 import { r2Publisher } from "../services/r2PublisherService";
 import { r2Storage } from "../services/r2StorageService";
 import { stationImporter } from "../services/stationImporterService";
+import { thaiWaterBulkIngestion } from "../services/thaiWaterBulkIngestion";
 import { thaiWaterIngestion } from "../services/thaiWaterIngestion";
 import { CreateBasinDto, RainfallStationArrayDto, WaterlevelStationArrayDto } from "../types/dto";
 
@@ -327,13 +329,20 @@ adminRouter.post("/import-all-datasets", async (c) => {
 
 /**
  * 6.3 POST /api/admin/sync/observations
- * Trigger telemetry observations sync (Scrapes day-by-day & writes to R2)
+ * Trigger telemetry observations sync (Bulk Ingestion by default, or ?mode=legacy)
  */
 adminRouter.post("/sync/observations", async (c) => {
   const basin = c.req.query("basin");
-  const result = await thaiWaterIngestion.syncAllTelemetry(basin);
+  const modeQuery = c.req.query("mode");
+  const isLegacy = modeQuery === "legacy" || (env.THAIWATER_INGESTION_MODE === "legacy" && modeQuery !== "bulk");
+
+  const result = isLegacy
+    ? await thaiWaterIngestion.syncAllTelemetry(basin)
+    : await thaiWaterBulkIngestion.syncAllTelemetryBulk({ targetBasinSlug: basin, writeStationCurrentJson: true });
+
   return c.json({
     success: true,
+    engine: isLegacy ? "legacy" : "bulk",
     result,
   });
 });

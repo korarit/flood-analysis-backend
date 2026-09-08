@@ -1,9 +1,11 @@
 import { Hono } from "hono";
-import { desc } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
+import { env } from "../config/env";
 import { db } from "../db";
 import { ingestionJobs } from "../db/schema";
 import { cronAuthMiddleware } from "../middleware/cronAuth";
 import { r2Publisher } from "../services/r2PublisherService";
+import { thaiWaterBulkIngestion } from "../services/thaiWaterBulkIngestion";
 import { thaiWaterIngestion } from "../services/thaiWaterIngestion";
 
 const cronRouter = new Hono();
@@ -14,9 +16,14 @@ cronRouter.use("/*", cronAuthMiddleware);
 /**
  * 2.2 Unified Trigger: POST /api/cron/sync-all
  * Ingests latest ThaiWater observations -> updates DB -> rebuilds & publishes all R2 datasets
+ * Query params:
+ *   ?basin=yom
+ *   ?mode=bulk | legacy
  */
 cronRouter.post("/sync-all", async (c) => {
   const basin = c.req.query("basin");
+  const modeQuery = c.req.query("mode");
+  const isLegacy = modeQuery === "legacy" || (env.THAIWATER_INGESTION_MODE === "legacy" && modeQuery !== "bulk");
   const startTime = new Date();
 
   // Create job record
@@ -32,8 +39,10 @@ cronRouter.post("/sync-all", async (c) => {
     .returning();
 
   try {
-    // 1. Scrape and update telemetry in PostgreSQL
-    const syncRes = await thaiWaterIngestion.syncAllTelemetry(basin);
+    // 1. Scrape and update telemetry in PostgreSQL (Bulk Engine or Legacy Scraper)
+    const syncRes = isLegacy
+      ? await thaiWaterIngestion.syncAllTelemetry(basin)
+      : await thaiWaterBulkIngestion.syncAllTelemetryBulk({ targetBasinSlug: basin, writeStationCurrentJson: true });
 
     // 2. Rebuild and publish datasets to Cloudflare R2
     const publishRes = await r2Publisher.rebuildAllDatasets(basin);
@@ -47,11 +56,12 @@ cronRouter.post("/sync-all", async (c) => {
         recordsProcessed: syncRes.synced,
         finishedAt: endTime,
       })
-      .where(desc(ingestionJobs.id));
+      .where(eq(ingestionJobs.id, job.id));
 
     return c.json({
       success: true,
       jobId: job.id,
+      engine: isLegacy ? "legacy" : "bulk",
       durationMs: endTime.getTime() - startTime.getTime(),
       summary: {
         basin: basin || "all",
@@ -71,7 +81,7 @@ cronRouter.post("/sync-all", async (c) => {
         errors: { message: err.message, stack: err.stack },
         finishedAt: new Date(),
       })
-      .where(desc(ingestionJobs.id));
+      .where(eq(ingestionJobs.id, job.id));
 
     return c.json(
       {
@@ -93,10 +103,17 @@ cronRouter.post("/sync-all", async (c) => {
  */
 cronRouter.post("/sync-telemetry", async (c) => {
   const basin = c.req.query("basin");
+  const modeQuery = c.req.query("mode");
+  const isLegacy = modeQuery === "legacy" || (env.THAIWATER_INGESTION_MODE === "legacy" && modeQuery !== "bulk");
+
   try {
-    const res = await thaiWaterIngestion.syncAllTelemetry(basin);
+    const res = isLegacy
+      ? await thaiWaterIngestion.syncAllTelemetry(basin)
+      : await thaiWaterBulkIngestion.syncAllTelemetryBulk({ targetBasinSlug: basin, writeStationCurrentJson: true });
+
     return c.json({
       success: true,
+      engine: isLegacy ? "legacy" : "bulk",
       data: res,
     });
   } catch (err: any) {
