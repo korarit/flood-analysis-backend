@@ -297,12 +297,12 @@ export class R2PublisherService {
               freshness: (t.freshnessStatus as any) || "fresh",
               alertReason: t.alertReasonTh ? { th: t.alertReasonTh, en: t.alertReasonEn || "" } : undefined,
               isUpstreamAlert: t.isUpstreamAlert === "true",
-              lastUpdated: t.timestamp?.toISOString() || this.getNowIso(),
+              lastUpdated: t.timestamp?.toISOString() || "",
             }
           : {
-              status: "normal",
-              freshness: "fresh",
-              lastUpdated: this.getNowIso(),
+              status: "missing",
+              freshness: "missing",
+              lastUpdated: "",
             },
       };
     });
