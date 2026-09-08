@@ -1,0 +1,87 @@
+name: ThaiWater Telemetry Ingestion & R2 Sync
+
+on:
+  # 1. Scheduled Ingestion (every 15 minutes)
+  schedule:
+    - cron: "*/15 * * * *"
+
+  # 2. Manual Trigger from GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Execution Mode"
+        required: true
+        default: "sync"
+        type: choice
+        options:
+          - "sync"      # Fast telemetry sync (~30-40s)
+          - "sync:all"  # Full metadata & R2 rebuild (~1-2m)
+      basin:
+        description: "Target Basin (slug or 'all')"
+        required: false
+        default: "all"
+        type: string
+
+jobs:
+  telemetry-sync:
+    name: Run Ingestion Engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # Step 1: Checkout repository
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Step 2: Setup Bun Environment
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Step 3: Install Dependencies
+      - name: Install Dependencies
+        run: bun install --frozen-lockfile
+
+      # Step 4: Run Telemetry Ingestion & R2 Publishing
+      - name: Execute Ingestion Pipeline
+        env:
+          # Database Connection (Must be accessible from GitHub Actions IP)
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+          # Cloudflare R2 Credentials
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || 'flood-analysis-project' }}
+          R2_PUBLIC_BASE_URL: ${{ secrets.R2_PUBLIC_BASE_URL || 'https://pub-6d09ad692430411182c45170ee192a0a.r2.dev' }}
+          R2_CUSTOM_ENDPOINT: ${{ secrets.R2_CUSTOM_ENDPOINT || 'https://c1cb1f0a6c635934ed103363ac3222c0.r2.cloudflarestorage.com' }}
+          R2_LOCAL_FALLBACK: "false"
+
+          # ThaiWater Platform API Configuration
+          THAIWATER_API_BASE_URL: ${{ secrets.THAIWATER_API_BASE_URL || 'https://twa-api-public.thaiwater.net' }}
+          THAIWATER_API_KEY: ${{ secrets.THAIWATER_API_KEY || 'TPSXrHRvTHeVT2Lygq6YeTqqAm4xZ72x' }}
+          THAIWATER_ORIGIN: ${{ secrets.THAIWATER_ORIGIN || 'https://twa.thaiwater.net' }}
+          THAIWATER_REFERER: ${{ secrets.THAIWATER_REFERER || 'https://twa.thaiwater.net/' }}
+          THAIWATER_INGESTION_MODE: "bulk"
+        run: |
+          TARGET_BASIN="${{ github.event.inputs.basin || 'all' }}"
+          MODE="${{ github.event.inputs.mode || 'sync' }}"
+
+          echo "🚀 Running Telemetry Pipeline..."
+          echo "   Mode:   $MODE"
+          echo "   Basin:  $TARGET_BASIN"
+
+          if [ "$MODE" = "sync:all" ]; then
+            if [ "$TARGET_BASIN" != "all" ]; then
+              bun run sync "$TARGET_BASIN" --full
+            else
+              bun run sync:all
+            fi
+          else
+            if [ "$TARGET_BASIN" != "all" ]; then
+              bun run sync "$TARGET_BASIN"
+            else
+              bun run sync
+            fi
+          fi
