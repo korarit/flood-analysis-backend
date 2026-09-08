@@ -1,9 +1,9 @@
 name: LLM Hydrological Bulletin Generator
 
 on:
-  # 1. Scheduled Ingestion (e.g. Every 2 hours)
+  # 1. Scheduled Ingestion (every 3 hours)
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: "0 */3 * * *"
 
   # 2. Manual Trigger from GitHub Actions UI
   workflow_dispatch:
