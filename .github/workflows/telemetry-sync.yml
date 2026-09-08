@@ -1,9 +1,9 @@
 name: ThaiWater Telemetry Ingestion & R2 Sync
 
 on:
-  # 1. Scheduled Ingestion (every 15 minutes) test
+  # 1. Scheduled Ingestion (every 15 minutes, offset to avoid top-of-hour GitHub queue delays)
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "7,22,37,52 * * * *"
 
   # 2. Manual Trigger from GitHub Actions UI
   workflow_dispatch:
@@ -65,8 +65,10 @@ jobs:
           THAIWATER_REFERER: ${{ secrets.THAIWATER_REFERER || 'https://twa.thaiwater.net/' }}
           THAIWATER_INGESTION_MODE: "bulk"
         run: |
-          TARGET_BASIN="${{ github.event.inputs.basin || 'all' }}"
-          MODE="${{ github.event.inputs.mode || 'sync' }}"
+          TARGET_BASIN="${{ inputs.basin || github.event.inputs.basin }}"
+          TARGET_BASIN="${TARGET_BASIN:-all}"
+          MODE="${{ inputs.mode || github.event.inputs.mode }}"
+          MODE="${MODE:-sync}"
 
           echo "🚀 Running Telemetry Pipeline..."
           echo "   Mode:   $MODE"

@@ -1,9 +1,9 @@
 name: LLM Hydrological Bulletin Generator
 
 on:
-  # 1. Scheduled Ingestion (every 3 hours)
+  # 1. Scheduled Generation (every 3 hours at 10 minutes past the hour)
   schedule:
-    - cron: "0 */3 * * *"
+    - cron: "10 */3 * * *"
 
   # 2. Manual Trigger from GitHub Actions UI
   workflow_dispatch:
@@ -55,7 +55,8 @@ jobs:
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || 'gpt-4o-mini' }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
         run: |
-          TARGET_BASIN="${{ github.event.inputs.basin || 'all' }}"
+          TARGET_BASIN="${{ inputs.basin || github.event.inputs.basin }}"
+          TARGET_BASIN="${TARGET_BASIN:-all}"
           echo "🤖 Starting LLM Hydrological Bulletin Generation..."
           echo "   Target Basin: $TARGET_BASIN"
 
