@@ -1,4 +1,4 @@
-name: LLM Hydrological Bulletin Generator
+name: LLM Hydrological Bulletin Generator V2
 
 on:
   # 1. Scheduled Generation (every 3 hours at 10 minutes past the hour)
@@ -16,7 +16,7 @@ on:
 
 jobs:
   generate-bulletin:
-    name: Generate Hydrological Bulletin
+    name: Generate Hydrological Bulletin V2
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -57,7 +57,7 @@ jobs:
         run: |
           TARGET_BASIN="${{ inputs.basin || github.event.inputs.basin }}"
           TARGET_BASIN="${TARGET_BASIN:-all}"
-          echo "🤖 Starting LLM Hydrological Bulletin Generation..."
+          echo "🤖 Starting LLM Hydrological Bulletin Generation V2..."
           echo "   Target Basin: $TARGET_BASIN"
 
           if [ "$TARGET_BASIN" != "all" ]; then
