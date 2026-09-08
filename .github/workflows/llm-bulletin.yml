@@ -35,13 +35,7 @@ jobs:
       - name: Install Dependencies
         run: bun install --frozen-lockfile
 
-      # Step 4: Ensure Database Tables Exist
-      - name: Ensure Database Tables Exist
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: bun run db:push --force
-
-      # Step 5: Run LLM Bulletin Generation & Publish to R2
+      # Step 4: Run LLM Bulletin Generation & Publish to R2
       - name: Execute LLM Bulletin Sync
         env:
           # Database Connection
