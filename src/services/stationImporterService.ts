@@ -80,7 +80,11 @@ export class StationImporterService {
   /**
    * Import Waterlevel Stations from JSON array
    */
-  async importWaterlevelStations(data: any[], basinSlugOrHint?: string): Promise<StationImportResult> {
+  async importWaterlevelStations(
+    data: any[],
+    basinSlugOrHint?: string,
+    options?: { skipR2?: boolean }
+  ): Promise<StationImportResult> {
     if (!Array.isArray(data) || data.length === 0) {
       return { success: false, type: "waterlevel", basinId: "unknown", total: 0, insertedOrUpdated: 0, errors: ["No data array provided"], r2Published: false };
     }
@@ -92,84 +96,98 @@ export class StationImporterService {
     const errors: any[] = [];
     const stationIds: string[] = [];
 
-    for (const item of data) {
-      try {
-        const st = item.station || {};
-        const agency = item.agency || {};
-        const geocode = item.geocode || {};
-        const stationId = String(st.id || "").trim();
+    const CONCURRENCY = 20;
+    for (let i = 0; i < data.length; i += CONCURRENCY) {
+      const batch = data.slice(i, i + CONCURRENCY);
+      await Promise.all(
+        batch.map(async (item) => {
+          try {
+            const st = item.station || {};
+            const agency = item.agency || {};
+            const geocode = item.geocode || {};
+            const stationId = String(st.id || "").trim();
 
-        if (!stationId) continue;
+            if (!stationId) return;
 
-        const record = {
-          id: stationId,
-          basinId: basinInfo.id,
-          oldcode: st.tele_station_oldcode || null,
-          stationType: "waterlevel",
-          nameTh: st.tele_station_name?.th || stationId,
-          nameEn: st.tele_station_name?.en || st.tele_station_name?.th || stationId,
-          lat: Number(st.tele_station_lat) || 0,
-          lon: Number(st.tele_station_long) || 0,
-          groundLevel: st.ground_level !== null && st.ground_level !== undefined ? Number(st.ground_level) : null,
-          minBank: st.min_bank !== null && st.min_bank !== undefined ? Number(st.min_bank) : null,
-          qmax: st.qmax !== null && st.qmax !== undefined ? Number(st.qmax) : null,
-          riverName: st.river_name || null,
-          sponsorBy: st.sponsor_by || null,
-          agencyNameTh: agency.agency_name?.th || null,
-          agencyNameEn: agency.agency_name?.en || null,
-          agencyShortnameTh: agency.agency_shortname?.th || null,
-          agencyShortnameEn: agency.agency_shortname?.en || null,
-          agencyCode: agency.agency_code || null,
-          areaCode: geocode.area_code ? String(geocode.area_code) : null,
-          areaNameTh: geocode.area_name?.th || null,
-          areaNameEn: geocode.area_name?.en || null,
-          amphoeNameTh: geocode.amphoe_name?.th || null,
-          amphoeNameEn: geocode.amphoe_name?.en || null,
-          tumbonNameTh: geocode.tumbon_name?.th || null,
-          tumbonNameEn: geocode.tumbon_name?.en || null,
-          provinceCode: geocode.province_code ? String(geocode.province_code) : null,
-          provinceNameTh: geocode.province_name?.th || null,
-          provinceNameEn: geocode.province_name?.en || null,
-          geoCode: geocode.geo_code ? String(geocode.geo_code) : null,
-          ridCode: geocode.rid_code ? String(geocode.rid_code) : null,
-          tmdCode: geocode.tmd_code ? String(geocode.tmd_code) : null,
-          status: "active",
-          rawMetadata: item,
-          updatedAt: new Date(),
-        };
+            const record = {
+              id: stationId,
+              basinId: basinInfo.id,
+              oldcode: st.tele_station_oldcode || null,
+              stationType: "waterlevel",
+              nameTh: st.tele_station_name?.th || stationId,
+              nameEn: st.tele_station_name?.en || st.tele_station_name?.th || stationId,
+              lat: Number(st.tele_station_lat) || 0,
+              lon: Number(st.tele_station_long) || 0,
+              groundLevel: st.ground_level !== null && st.ground_level !== undefined ? Number(st.ground_level) : null,
+              minBank: st.min_bank !== null && st.min_bank !== undefined ? Number(st.min_bank) : null,
+              qmax: st.qmax !== null && st.qmax !== undefined ? Number(st.qmax) : null,
+              riverName: st.river_name || null,
+              sponsorBy: st.sponsor_by || null,
+              agencyNameTh: agency.agency_name?.th || null,
+              agencyNameEn: agency.agency_name?.en || null,
+              agencyShortnameTh: agency.agency_shortname?.th || null,
+              agencyShortnameEn: agency.agency_shortname?.en || null,
+              agencyCode: agency.agency_code || null,
+              areaCode: geocode.area_code ? String(geocode.area_code) : null,
+              areaNameTh: geocode.area_name?.th || null,
+              areaNameEn: geocode.area_name?.en || null,
+              amphoeNameTh: geocode.amphoe_name?.th || null,
+              amphoeNameEn: geocode.amphoe_name?.en || null,
+              tumbonNameTh: geocode.tumbon_name?.th || null,
+              tumbonNameEn: geocode.tumbon_name?.en || null,
+              provinceCode: geocode.province_code ? String(geocode.province_code) : null,
+              provinceNameTh: geocode.province_name?.th || null,
+              provinceNameEn: geocode.province_name?.en || null,
+              geoCode: geocode.geo_code ? String(geocode.geo_code) : null,
+              ridCode: geocode.rid_code ? String(geocode.rid_code) : null,
+              tmdCode: geocode.tmd_code ? String(geocode.tmd_code) : null,
+              status: "active",
+              rawMetadata: item,
+              updatedAt: new Date(),
+            };
 
-        // Auto Insert & Auto Update (Upsert)
-        await db
-          .insert(waterlevelStations)
-          .values(record)
-          .onConflictDoUpdate({
-            target: waterlevelStations.id,
-            set: record,
-          });
+            // Auto Insert & Auto Update (Upsert)
+            await db
+              .insert(waterlevelStations)
+              .values(record)
+              .onConflictDoUpdate({
+                target: waterlevelStations.id,
+                set: record,
+              });
 
-        stationIds.push(stationId);
-        count++;
-      } catch (err: any) {
-        errors.push({ id: item.station?.id, error: err.message });
-      }
+            stationIds.push(stationId);
+            count++;
+          } catch (err: any) {
+            errors.push({ id: item.station?.id, error: err.message });
+          }
+        })
+      );
     }
 
-    // Auto-Publish R2 Datasets for Frontend
+    // Auto-Publish R2 Datasets for Frontend (Skipped if skipR2: true)
     let r2Published = false;
-    try {
-      await r2Publisher.publishBasinStationsList(basinInfo.slug);
-      await r2Publisher.publishBasinOverview(basinInfo.slug);
-      await r2Publisher.publishBasinsList();
+    if (!options?.skipR2) {
+      try {
+        await r2Publisher.publishBasinStationsList(basinInfo.slug);
+        await r2Publisher.publishBasinOverview(basinInfo.slug);
+        await r2Publisher.publishBasinsList();
 
-      const allTele = await db.select().from(telemetryLatest);
-      const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
+        const allTele = await db.select().from(telemetryLatest);
+        const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
 
-      for (const sid of stationIds) {
-        await r2Publisher.publishStationDatasets(sid, teleMap);
+        const CONCURRENCY = 50;
+        for (let i = 0; i < stationIds.length; i += CONCURRENCY) {
+          const batch = stationIds.slice(i, i + CONCURRENCY);
+          await Promise.all(
+            batch.map((sid) =>
+              r2Publisher.publishStationDatasets(sid, teleMap).catch(() => {})
+            )
+          );
+        }
+        r2Published = true;
+      } catch (pubErr) {
+        console.warn("⚠️ R2 auto-publishing after waterlevel import encountered warning:", pubErr);
       }
-      r2Published = true;
-    } catch (pubErr) {
-      console.warn("⚠️ R2 auto-publishing after waterlevel import encountered warning:", pubErr);
     }
 
     return {
@@ -186,7 +204,11 @@ export class StationImporterService {
   /**
    * Import Rainfall Stations from JSON array
    */
-  async importRainfallStations(data: any[], basinSlugOrHint?: string): Promise<StationImportResult> {
+  async importRainfallStations(
+    data: any[],
+    basinSlugOrHint?: string,
+    options?: { skipR2?: boolean }
+  ): Promise<StationImportResult> {
     if (!Array.isArray(data) || data.length === 0) {
       return { success: false, type: "rainfall", basinId: "unknown", total: 0, insertedOrUpdated: 0, errors: ["No data array provided"], r2Published: false };
     }
@@ -198,81 +220,95 @@ export class StationImporterService {
     const errors: any[] = [];
     const stationIds: string[] = [];
 
-    for (const item of data) {
-      try {
-        const st = item.station || {};
-        const agency = item.agency || {};
-        const geocode = item.geocode || {};
-        const stationId = String(st.id || "").trim();
+    const CONCURRENCY = 20;
+    for (let i = 0; i < data.length; i += CONCURRENCY) {
+      const batch = data.slice(i, i + CONCURRENCY);
+      await Promise.all(
+        batch.map(async (item) => {
+          try {
+            const st = item.station || {};
+            const agency = item.agency || {};
+            const geocode = item.geocode || {};
+            const stationId = String(st.id || "").trim();
 
-        if (!stationId) continue;
+            if (!stationId) return;
 
-        const record = {
-          id: stationId,
-          basinId: basinInfo.id,
-          oldcode: st.tele_station_oldcode || null,
-          stationType: "rainfall_24h",
-          subBasinId: st.sub_basin_id ? String(st.sub_basin_id) : null,
-          subBasinName: st.sub_basin_name || null,
-          sponsorBy: st.sponsor_by || null,
-          nameTh: st.tele_station_name?.th || stationId,
-          nameEn: st.tele_station_name?.en || st.tele_station_name?.th || stationId,
-          lat: Number(st.tele_station_lat) || 0,
-          lon: Number(st.tele_station_long) || 0,
-          warningZone: geocode.warning_zone ? String(geocode.warning_zone) : null,
-          warningRain24h: 35.0,
-          criticalRain24h: 90.0,
-          agencyNameTh: agency.agency_name?.th || null,
-          agencyNameEn: agency.agency_name?.en || null,
-          agencyShortnameTh: agency.agency_shortname?.th || null,
-          agencyShortnameEn: agency.agency_shortname?.en || null,
-          areaCode: geocode.area_code ? String(geocode.area_code) : null,
-          areaNameTh: geocode.area_name?.th || null,
-          areaNameEn: geocode.area_name?.en || null,
-          amphoeNameTh: geocode.amphoe_name?.th || null,
-          amphoeNameEn: geocode.amphoe_name?.en || null,
-          tumbonNameTh: geocode.tumbon_name?.th || null,
-          tumbonNameEn: geocode.tumbon_name?.en || null,
-          provinceCode: geocode.province_code ? String(geocode.province_code) : null,
-          provinceNameTh: geocode.province_name?.th || null,
-          provinceNameEn: geocode.province_name?.en || null,
-          status: "active",
-          rawMetadata: item,
-          updatedAt: new Date(),
-        };
+            const record = {
+              id: stationId,
+              basinId: basinInfo.id,
+              oldcode: st.tele_station_oldcode || null,
+              stationType: "rainfall_24h",
+              subBasinId: st.sub_basin_id ? String(st.sub_basin_id) : null,
+              subBasinName: st.sub_basin_name || null,
+              sponsorBy: st.sponsor_by || null,
+              nameTh: st.tele_station_name?.th || stationId,
+              nameEn: st.tele_station_name?.en || st.tele_station_name?.th || stationId,
+              lat: Number(st.tele_station_lat) || 0,
+              lon: Number(st.tele_station_long) || 0,
+              warningZone: geocode.warning_zone ? String(geocode.warning_zone) : null,
+              warningRain24h: 35.0,
+              criticalRain24h: 90.0,
+              agencyNameTh: agency.agency_name?.th || null,
+              agencyNameEn: agency.agency_name?.en || null,
+              agencyShortnameTh: agency.agency_shortname?.th || null,
+              agencyShortnameEn: agency.agency_shortname?.en || null,
+              areaCode: geocode.area_code ? String(geocode.area_code) : null,
+              areaNameTh: geocode.area_name?.th || null,
+              areaNameEn: geocode.area_name?.en || null,
+              amphoeNameTh: geocode.amphoe_name?.th || null,
+              amphoeNameEn: geocode.amphoe_name?.en || null,
+              tumbonNameTh: geocode.tumbon_name?.th || null,
+              tumbonNameEn: geocode.tumbon_name?.en || null,
+              provinceCode: geocode.province_code ? String(geocode.province_code) : null,
+              provinceNameTh: geocode.province_name?.th || null,
+              provinceNameEn: geocode.province_name?.en || null,
+              status: "active",
+              rawMetadata: item,
+              updatedAt: new Date(),
+            };
 
-        // Auto Insert & Auto Update (Upsert)
-        await db
-          .insert(rainfallStations)
-          .values(record)
-          .onConflictDoUpdate({
-            target: rainfallStations.id,
-            set: record,
-          });
+            // Auto Insert & Auto Update (Upsert)
+            await db
+              .insert(rainfallStations)
+              .values(record)
+              .onConflictDoUpdate({
+                target: rainfallStations.id,
+                set: record,
+              });
 
-        stationIds.push(stationId);
-        count++;
-      } catch (err: any) {
-        errors.push({ id: item.station?.id, error: err.message });
-      }
+            stationIds.push(stationId);
+            count++;
+          } catch (err: any) {
+            errors.push({ id: item.station?.id, error: err.message });
+          }
+        })
+      );
     }
 
-    // Auto-Publish R2 Datasets for Frontend
+    // Auto-Publish R2 Datasets for Frontend (Skipped if skipR2: true)
     let r2Published = false;
-    try {
-      await r2Publisher.publishBasinStationsList(basinInfo.slug);
-      await r2Publisher.publishBasinOverview(basinInfo.slug);
-      await r2Publisher.publishBasinsList();
+    if (!options?.skipR2) {
+      try {
+        await r2Publisher.publishBasinStationsList(basinInfo.slug);
+        await r2Publisher.publishBasinOverview(basinInfo.slug);
+        await r2Publisher.publishBasinsList();
 
-      const allTele = await db.select().from(telemetryLatest);
-      const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
+        const allTele = await db.select().from(telemetryLatest);
+        const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
 
-      for (const sid of stationIds) {
-        await r2Publisher.publishStationDatasets(sid, teleMap);
+        const CONCURRENCY = 50;
+        for (let i = 0; i < stationIds.length; i += CONCURRENCY) {
+          const batch = stationIds.slice(i, i + CONCURRENCY);
+          await Promise.all(
+            batch.map((sid) =>
+              r2Publisher.publishStationDatasets(sid, teleMap).catch(() => {})
+            )
+          );
+        }
+        r2Published = true;
+      } catch (pubErr) {
+        console.warn("⚠️ R2 auto-publishing after rainfall import encountered warning:", pubErr);
       }
-      r2Published = true;
-    } catch (pubErr) {
-      console.warn("⚠️ R2 auto-publishing after rainfall import encountered warning:", pubErr);
     }
 
     return {
@@ -293,7 +329,11 @@ export class StationImporterService {
    * 3. Inserts normalized graph edges into station_relations table
    * 4. Auto-publishes updated R2 datasets for all affected stations
    */
-  async importRelations(data: any[], basinSlugHint?: string): Promise<{ success: boolean; total: number; inserted: number; errors: any[] }> {
+  async importRelations(
+    data: any[],
+    basinSlugHint?: string,
+    options?: { skipR2?: boolean }
+  ): Promise<{ success: boolean; total: number; inserted: number; errors: any[] }> {
     if (!Array.isArray(data) || data.length === 0) {
       return { success: false, total: 0, inserted: 0, errors: ["No relation data array provided"] };
     }
@@ -302,6 +342,7 @@ export class StationImporterService {
     const errors: any[] = [];
     const touchedStationIds = new Set<string>();
     const rainfallReceiversMap = new Map<string, Array<any>>();
+    const relationsToInsert: any[] = [];
 
     const allWL = await db
       .select({ id: waterlevelStations.id, nameTh: waterlevelStations.nameTh, nameEn: waterlevelStations.nameEn })
@@ -354,28 +395,23 @@ export class StationImporterService {
         if (!targetId) continue;
         touchedStationIds.add(targetId);
 
-        try {
-          await db.insert(stationRelations).values({
-            stationId: sourceId,
-            targetStationId: targetId,
-            relationType: "downstream",
-            distanceKm: ds.distanceKm !== null && ds.distanceKm !== undefined ? Number(ds.distanceKm) : null,
-            travelTimeHours: ds.travelTimeHours !== null && ds.travelTimeHours !== undefined ? Number(ds.travelTimeHours) : null,
-            travelTimeMinutes: ds.travelTimeMinutes !== null && ds.travelTimeMinutes !== undefined ? Number(ds.travelTimeMinutes) : null,
-            travelTimeHoursMin: ds.travelTimeHoursMin !== null && ds.travelTimeHoursMin !== undefined ? Number(ds.travelTimeHoursMin) : null,
-            travelTimeHoursMax: ds.travelTimeHoursMax !== null && ds.travelTimeHoursMax !== undefined ? Number(ds.travelTimeHoursMax) : null,
-            travelTimeMinutesMin: ds.travelTimeMinutesMin !== null && ds.travelTimeMinutesMin !== undefined ? Number(ds.travelTimeMinutesMin) : null,
-            travelTimeMinutesMax: ds.travelTimeMinutesMax !== null && ds.travelTimeMinutesMax !== undefined ? Number(ds.travelTimeMinutesMax) : null,
-            riverSlope: ds.riverSlope !== null && ds.riverSlope !== undefined ? Number(ds.riverSlope) : null,
-            elevationDiffM: ds.elevationDiffM !== null && ds.elevationDiffM !== undefined ? Number(ds.elevationDiffM) : null,
-            confidence: ds.confidence || null,
-            responseType: ds.responseType || null,
-            rawMetadata: ds,
-          });
-          inserted++;
-        } catch (err: any) {
-          errors.push({ sourceId, targetId, error: err.message });
-        }
+        relationsToInsert.push({
+          stationId: sourceId,
+          targetStationId: targetId,
+          relationType: "downstream",
+          distanceKm: ds.distanceKm !== null && ds.distanceKm !== undefined ? Number(ds.distanceKm) : null,
+          travelTimeHours: ds.travelTimeHours !== null && ds.travelTimeHours !== undefined ? Number(ds.travelTimeHours) : null,
+          travelTimeMinutes: ds.travelTimeMinutes !== null && ds.travelTimeMinutes !== undefined ? Number(ds.travelTimeMinutes) : null,
+          travelTimeHoursMin: ds.travelTimeHoursMin !== null && ds.travelTimeHoursMin !== undefined ? Number(ds.travelTimeHoursMin) : null,
+          travelTimeHoursMax: ds.travelTimeHoursMax !== null && ds.travelTimeHoursMax !== undefined ? Number(ds.travelTimeHoursMax) : null,
+          travelTimeMinutesMin: ds.travelTimeMinutesMin !== null && ds.travelTimeMinutesMin !== undefined ? Number(ds.travelTimeMinutesMin) : null,
+          travelTimeMinutesMax: ds.travelTimeMinutesMax !== null && ds.travelTimeMinutesMax !== undefined ? Number(ds.travelTimeMinutesMax) : null,
+          riverSlope: ds.riverSlope !== null && ds.riverSlope !== undefined ? Number(ds.riverSlope) : null,
+          elevationDiffM: ds.elevationDiffM !== null && ds.elevationDiffM !== undefined ? Number(ds.elevationDiffM) : null,
+          confidence: ds.confidence || null,
+          responseType: ds.responseType || null,
+          rawMetadata: ds,
+        });
       }
 
       // 4. Process Influencing Stations (Rainfall -> Waterlevel) & Accumulate Inverted Index
@@ -406,62 +442,85 @@ export class StationImporterService {
           rainfallThresholds: inf.rainfallThresholds || null,
         });
 
-        try {
-          await db.insert(stationRelations).values({
-            stationId: sourceId,
-            targetStationId: rfId,
-            relationType: "influencing",
-            distanceKm: inf.distanceKm !== null && inf.distanceKm !== undefined ? Number(inf.distanceKm) : null,
-            travelTimeHours: inf.travelTimeHours !== null && inf.travelTimeHours !== undefined ? Number(inf.travelTimeHours) : null,
-            travelTimeMinutes: inf.travelTimeMinutes !== null && inf.travelTimeMinutes !== undefined ? Number(inf.travelTimeMinutes) : null,
-            travelTimeHoursMin: inf.travelTimeHoursMin !== null && inf.travelTimeHoursMin !== undefined ? Number(inf.travelTimeHoursMin) : null,
-            travelTimeHoursMax: inf.travelTimeHoursMax !== null && inf.travelTimeHoursMax !== undefined ? Number(inf.travelTimeHoursMax) : null,
-            travelTimeMinutesMin: inf.travelTimeMinutesMin !== null && inf.travelTimeMinutesMin !== undefined ? Number(inf.travelTimeMinutesMin) : null,
-            travelTimeMinutesMax: inf.travelTimeMinutesMax !== null && inf.travelTimeMinutesMax !== undefined ? Number(inf.travelTimeMinutesMax) : null,
-            confidence: inf.confidence || null,
-            responseType: inf.responseType || null,
-            rawMetadata: inf,
-          });
-          inserted++;
-        } catch (err: any) {
-          errors.push({ sourceId, targetId: rfId, error: err.message });
-        }
+        relationsToInsert.push({
+          stationId: sourceId,
+          targetStationId: rfId,
+          relationType: "influencing",
+          distanceKm: inf.distanceKm !== null && inf.distanceKm !== undefined ? Number(inf.distanceKm) : null,
+          travelTimeHours: inf.travelTimeHours !== null && inf.travelTimeHours !== undefined ? Number(inf.travelTimeHours) : null,
+          travelTimeMinutes: inf.travelTimeMinutes !== null && inf.travelTimeMinutes !== undefined ? Number(inf.travelTimeMinutes) : null,
+          travelTimeHoursMin: inf.travelTimeHoursMin !== null && inf.travelTimeHoursMin !== undefined ? Number(inf.travelTimeHoursMin) : null,
+          travelTimeHoursMax: inf.travelTimeHoursMax !== null && inf.travelTimeHoursMax !== undefined ? Number(inf.travelTimeHoursMax) : null,
+          travelTimeMinutesMin: inf.travelTimeMinutesMin !== null && inf.travelTimeMinutesMin !== undefined ? Number(inf.travelTimeMinutesMin) : null,
+          travelTimeMinutesMax: inf.travelTimeMinutesMax !== null && inf.travelTimeMinutesMax !== undefined ? Number(inf.travelTimeMinutesMax) : null,
+          confidence: inf.confidence || null,
+          responseType: inf.responseType || null,
+          rawMetadata: inf,
+        });
       }
     }
 
-    // 5. Update rainfall_stations metadata with receivingWaterlevelStations
-    for (const [rfId, receivers] of rainfallReceiversMap.entries()) {
+    // Batch Insert All Relations in chunks of 100
+    const REL_BATCH = 100;
+    for (let i = 0; i < relationsToInsert.length; i += REL_BATCH) {
+      const batch = relationsToInsert.slice(i, i + REL_BATCH);
       try {
-        const [currentRF] = await db.select().from(rainfallStations).where(eq(rainfallStations.id, rfId));
-        if (currentRF) {
-          const existingMeta = (currentRF.rawMetadata as Record<string, any>) || {};
-          await db
-            .update(rainfallStations)
-            .set({
-              rawMetadata: {
-                ...existingMeta,
-                relations: {
-                  receivingWaterlevelStations: receivers,
-                },
-              },
-              updatedAt: new Date(),
-            })
-            .where(eq(rainfallStations.id, rfId));
-        }
-      } catch (rfErr: any) {
-        errors.push({ rfId, error: `Failed to update rainfall metadata: ${rfErr.message}` });
+        await db.insert(stationRelations).values(batch);
+        inserted += batch.length;
+      } catch (err: any) {
+        errors.push({ batchIndex: i, error: err.message });
       }
     }
 
-    // 6. Auto-Publish R2 relations for all touched stations
-    const allTele = await db.select().from(telemetryLatest);
-    const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
+    // 5. Update rainfall_stations metadata with receivingWaterlevelStations concurrently
+    const rfEntries = Array.from(rainfallReceiversMap.entries());
+    const CONCURRENCY = 20;
+    for (let i = 0; i < rfEntries.length; i += CONCURRENCY) {
+      const batch = rfEntries.slice(i, i + CONCURRENCY);
+      await Promise.all(
+        batch.map(async ([rfId, receivers]) => {
+          try {
+            const [currentRF] = await db.select().from(rainfallStations).where(eq(rainfallStations.id, rfId));
+            if (currentRF) {
+              const existingMeta = (currentRF.rawMetadata as Record<string, any>) || {};
+              await db
+                .update(rainfallStations)
+                .set({
+                  rawMetadata: {
+                    ...existingMeta,
+                    relations: {
+                      receivingWaterlevelStations: receivers,
+                    },
+                  },
+                  updatedAt: new Date(),
+                })
+                .where(eq(rainfallStations.id, rfId));
+            }
+          } catch (rfErr: any) {
+            errors.push({ rfId, error: `Failed to update rainfall metadata: ${rfErr.message}` });
+          }
+        })
+      );
+    }
 
-    for (const sid of touchedStationIds) {
+    // 6. Auto-Publish R2 relations for all touched stations (Skipped if skipR2: true)
+    if (!options?.skipR2) {
       try {
-        await r2Publisher.publishStationDatasets(sid, teleMap);
-      } catch (err) {
-        // Continue
+        const allTele = await db.select().from(telemetryLatest);
+        const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
+
+        const touchedList = Array.from(touchedStationIds);
+        const CONCURRENCY = 50;
+        for (let i = 0; i < touchedList.length; i += CONCURRENCY) {
+          const batch = touchedList.slice(i, i + CONCURRENCY);
+          await Promise.all(
+            batch.map((sid) =>
+              r2Publisher.publishStationDatasets(sid, teleMap).catch(() => {})
+            )
+          );
+        }
+      } catch (pubErr) {
+        console.warn("⚠️ R2 auto-publishing after relations import encountered warning:", pubErr);
       }
     }
 

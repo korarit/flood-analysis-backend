@@ -46,7 +46,7 @@ async function main() {
         await db.delete(waterlevelStations).where(eq(waterlevelStations.basinId, basinInfo.id));
         console.log(`  Purged old waterlevel stations for basin ${slug}`);
 
-        const wlResult = await importer.importWaterlevelStations(wlData, slug);
+        const wlResult = await importer.importWaterlevelStations(wlData, slug, { skipR2: true });
         console.log(`  ✅ Imported ${wlResult.insertedOrUpdated} / ${wlResult.total} waterlevel stations`);
         totalWaterlevelImported += wlResult.insertedOrUpdated;
       } catch (err: any) {
@@ -66,7 +66,7 @@ async function main() {
         await db.delete(rainfallStations).where(eq(rainfallStations.basinId, basinInfo.id));
         console.log(`  Purged old rainfall stations for basin ${slug}`);
 
-        const rainResult = await importer.importRainfallStations(rainData, slug);
+        const rainResult = await importer.importRainfallStations(rainData, slug, { skipR2: true });
         console.log(`  ✅ Imported ${rainResult.insertedOrUpdated} / ${rainResult.total} rainfall stations`);
         totalRainfallImported += rainResult.insertedOrUpdated;
         if (rainResult.errors.length > 0) {
@@ -87,7 +87,7 @@ async function main() {
         
         // Clean old relations for this basin
         // Relations reference stations from this basin
-        const relResult = await importer.importRelations(relData, slug);
+        const relResult = await importer.importRelations(relData, slug, { skipR2: true });
         console.log(`  ✅ Imported ${relResult.inserted} / ${relResult.total} relations`);
         totalRelationsImported += relResult.inserted;
       } catch (err: any) {

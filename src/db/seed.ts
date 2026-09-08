@@ -154,14 +154,14 @@ export async function seedDatabase() {
         const wlFile = join(stationDir, `${slug}_waterlevel_stations.json`);
         if (existsSync(wlFile)) {
           const data = JSON.parse(readFileSync(wlFile, "utf-8"));
-          await stationImporter.importWaterlevelStations(data, `${slug}_waterlevel_stations.json`);
+          await stationImporter.importWaterlevelStations(data, `${slug}_waterlevel_stations.json`, { skipR2: true });
         }
 
         // Rainfall
         const rainFile = join(stationDir, `${slug}_rain_stations.json`);
         if (existsSync(rainFile)) {
           const data = JSON.parse(readFileSync(rainFile, "utf-8"));
-          await stationImporter.importRainfallStations(data, `${slug}_rain_stations.json`);
+          await stationImporter.importRainfallStations(data, `${slug}_rain_stations.json`, { skipR2: true });
         }
 
         // Relations (Prioritize relations_frontend.json)
@@ -170,10 +170,11 @@ export async function seedDatabase() {
         const relFile = existsSync(relFrontend) ? relFrontend : existsSync(relWaterlevel) ? relWaterlevel : null;
         if (relFile) {
           const data = JSON.parse(readFileSync(relFile, "utf-8"));
-          await stationImporter.importRelations(data, slug);
+          await stationImporter.importRelations(data, slug, { skipR2: true });
         }
+        console.log(`  -> Basin [${slug}] stations & relations imported.`);
       }
-      console.log("✅ Finished importing stations and relations from dataset folders");
+      console.log("✅ Finished importing stations and relations from dataset folders (DB only)");
     }
 
     console.log("🎉 Seeding completed successfully!");
