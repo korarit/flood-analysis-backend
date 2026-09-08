@@ -231,9 +231,9 @@ adminRouter.post("/stations/upload", async (c) => {
 });
 
 /**
- * POST /api/admin/relations/upload
+ * POST /api/admin/relations/upload?basin=xxx
  * Upload & Auto Upsert relation_waterlevel_frontend.json
- * Automatically triggers R2 relation datasets publishing immediately!
+ * Automatically triggers R2 relation datasets publishing AND river/chain.json rebuild!
  */
 adminRouter.post("/relations/upload", async (c) => {
   try {
@@ -257,10 +257,75 @@ adminRouter.post("/relations/upload", async (c) => {
     }
 
     const result = await stationImporter.importRelations(payload, basinHint);
+
+    // Rebuild river/chain.json for the basin after relations update
+    if (basinHint) {
+      try {
+        await r2Publisher.publishSpatialAndReports(basinHint);
+      } catch (rebuildErr: any) {
+        console.warn(`⚠️ chain.json rebuild warning after relations upload for '${basinHint}':`, rebuildErr.message);
+      }
+    }
+
     return c.json({
       success: true,
-      message: `Successfully processed relations (${result.inserted} inserted/updated) and published to R2`,
+      message: `Successfully processed relations (${result.inserted} inserted/updated), published to R2, and rebuilt river/chain.json`,
       data: result,
+    });
+  } catch (err: any) {
+    return c.json({ success: false, error: err.message }, 500);
+  }
+});
+
+/**
+ * POST /api/admin/basins/:slug/relations
+ * Basin-scoped upload of relation_waterlevel_frontend.json.
+ * Validates basin exists, imports relations, rebuilds river/chain.json.
+ */
+adminRouter.post("/basins/:slug/relations", async (c) => {
+  const slug = c.req.param("slug");
+
+  try {
+    const [basin] = await db.select().from(basins).where(eq(basins.slug, slug));
+    if (!basin) {
+      return c.json({ success: false, error: `Basin with slug '${slug}' not found` }, 404);
+    }
+
+    let payload: any;
+    const contentType = c.req.header("content-type") || "";
+    if (contentType.includes("multipart/form-data")) {
+      const body = await c.req.parseBody();
+      const file = body["file"];
+      if (file instanceof File) {
+        const text = await file.text();
+        payload = JSON.parse(text);
+      } else if (typeof file === "string") {
+        payload = JSON.parse(file);
+      }
+    } else {
+      payload = await c.req.json();
+    }
+
+    if (!Array.isArray(payload)) {
+      return c.json({ success: false, error: "Expected an array of station relation objects" }, 400);
+    }
+
+    // Import relations with basin slug as hint
+    const result = await stationImporter.importRelations(payload, slug);
+
+    // Rebuild river/chain.json for this basin
+    let chainRebuilt = false;
+    try {
+      await r2Publisher.publishSpatialAndReports(slug);
+      chainRebuilt = true;
+    } catch (rebuildErr: any) {
+      console.warn(`⚠️ chain.json rebuild warning for '${slug}':`, rebuildErr.message);
+    }
+
+    return c.json({
+      success: true,
+      message: `Successfully imported ${result.inserted} relations for basin '${slug}' and rebuilt river/chain.json`,
+      data: { ...result, chainRebuilt },
     });
   } catch (err: any) {
     return c.json({ success: false, error: err.message }, 500);

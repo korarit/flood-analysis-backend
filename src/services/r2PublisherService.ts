@@ -94,6 +94,102 @@ export class R2PublisherService {
   }
 
   /**
+   * Build ordered station chain from station_relations downstream graph.
+   * Uses topological sort (Kahn's algorithm) to order stations upstream→downstream.
+   * Filters to only include stations that have telemetry data (non-missing).
+   * Returns { orderedStationIds, edges } for river/chain.json.
+   */
+  private async buildOrderedChainFromRelations(
+    basinId: string,
+    _teleMap: Map<string, any> // kept for signature compat, not used for filtering
+  ): Promise<{
+    orderedStationIds: string[];
+    edges: Array<{ from: string; to: string; travelTimeHours: number | null; travelTimeHoursMin: number | null; travelTimeHoursMax: number | null; distanceKm: number | null; confidence: string | null }>;
+  }> {
+    // 1. Get all waterlevel stations for this basin
+    const wlStations = await db
+      .select({ id: waterlevelStations.id })
+      .from(waterlevelStations)
+      .where(eq(waterlevelStations.basinId, basinId));
+
+    const wlIdSet = new Set(wlStations.map((s) => s.id));
+
+    // 2. Get all downstream relations for waterlevel stations in this basin
+    const allRelations = await db.select().from(stationRelations);
+    const downstreamRels = allRelations.filter(
+      (r) => r.relationType === "downstream" && wlIdSet.has(r.stationId)
+    );
+
+    if (downstreamRels.length === 0) {
+      // No relation data — fall back to all WL stations (no telemetry filter; R2 snapshot is source of truth)
+      const allIds = wlStations.map((s) => s.id).slice(0, 15);
+      return { orderedStationIds: allIds, edges: [] };
+    }
+
+    // 3. Build adjacency: { sourceId → [{ targetId, ...meta }] }
+    const adjMap = new Map<string, Array<typeof downstreamRels[0]>>();
+    const inDegree = new Map<string, number>();
+    const allNodes = new Set<string>();
+
+    for (const rel of downstreamRels) {
+      allNodes.add(rel.stationId);
+      allNodes.add(rel.targetStationId);
+      if (!adjMap.has(rel.stationId)) adjMap.set(rel.stationId, []);
+      adjMap.get(rel.stationId)!.push(rel);
+      inDegree.set(rel.targetStationId, (inDegree.get(rel.targetStationId) || 0) + 1);
+    }
+    // Ensure all source nodes have an inDegree entry
+    for (const node of allNodes) {
+      if (!inDegree.has(node)) inDegree.set(node, 0);
+    }
+
+    // 4. Kahn's topological sort
+    const queue: string[] = [];
+    for (const [node, deg] of inDegree.entries()) {
+      if (deg === 0) queue.push(node);
+    }
+
+    const orderedAll: string[] = [];
+    const visitedEdges: Array<{ from: string; to: string; travelTimeHours: number | null; travelTimeHoursMin: number | null; travelTimeHoursMax: number | null; distanceKm: number | null; confidence: string | null }> = [];
+
+    while (queue.length > 0) {
+      // Pick upstream-most node (stable sort by id for determinism)
+      queue.sort();
+      const curr = queue.shift()!;
+      orderedAll.push(curr);
+
+      const neighbors = adjMap.get(curr) || [];
+      for (const rel of neighbors) {
+        visitedEdges.push({
+          from: rel.stationId,
+          to: rel.targetStationId,
+          travelTimeHours: rel.travelTimeHours ?? null,
+          travelTimeHoursMin: rel.travelTimeHoursMin ?? null,
+          travelTimeHoursMax: rel.travelTimeHoursMax ?? null,
+          distanceKm: rel.distanceKm ?? null,
+          confidence: rel.confidence ?? null,
+        });
+        const newDeg = (inDegree.get(rel.targetStationId) || 1) - 1;
+        inDegree.set(rel.targetStationId, newDeg);
+        if (newDeg === 0) queue.push(rel.targetStationId);
+      }
+    }
+
+    // 5. Filter to only stations that are waterlevel stations of this basin
+    //    No telemetry filter here — R2 stations.json freshness is the source of truth for "has data"
+    //    The frontend (mapR2StationToStation) will determine which stations have live data to display
+    const orderedStationIds = orderedAll.filter((id) => wlIdSet.has(id));
+
+    // 6. Filter edges to only include edges between stations in orderedStationIds
+    const includedSet = new Set(orderedStationIds);
+    const filteredEdges = visitedEdges.filter(
+      (e) => includedSet.has(e.from) && includedSet.has(e.to)
+    );
+
+    return { orderedStationIds, edges: filteredEdges };
+  }
+
+  /**
    * 4.1 Publish `/basins.json` (หน้ารวมลุ่มน้ำทั้งประเทศ - เฉพาะ is_active = true)
    */
   async publishBasinsList(): Promise<{ success: boolean; url: string }> {
@@ -544,16 +640,18 @@ export class R2PublisherService {
     const allTele = await db.select().from(telemetryLatest).where(eq(telemetryLatest.basinId, b.id));
     const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
 
-    // 1. river/chain.json
+    // 1. river/chain.json — built from station_relations downstream graph (topological order)
     const chainPath = `basin/${b.slug}/river/chain.json`;
+    const { orderedStationIds, edges } = await this.buildOrderedChainFromRelations(b.id, teleMap);
     const chainPayload = {
       schemaVersion: this.schemaVersion,
       basin: b.slug,
       river: b.slug,
       generatedAt: this.getNowIso(),
-      stations: bStations.filter((s) => s.type === "water_level").slice(0, 10).map((s) => s.id),
+      stations: orderedStationIds,
+      edges,
     };
-    await r2Storage.putJson(chainPath, chainPayload, "public, max-age=86400, s-maxage=86400");
+    await r2Storage.putJson(chainPath, chainPayload, "public, max-age=3600, s-maxage=3600");
 
     // 2. events/feed.json
     const alertEvents: any[] = [];
