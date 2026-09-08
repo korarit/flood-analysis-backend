@@ -9,6 +9,7 @@ import {
   StationCurrentDataset,
   TrendDirection,
 } from "../types";
+import { formatBangkokDateTime, parseThaiWaterDate } from "../utils/date";
 import { r2Publisher } from "./r2PublisherService";
 import { r2Storage } from "./r2StorageService";
 
@@ -132,12 +133,7 @@ export class ThaiWaterBulkIngestionService {
   }
 
   private formatDateTime(d: Date): string {
-    const pad = (n: number) => String(n).padStart(2, "0");
-    const year = d.getFullYear();
-    const month = pad(d.getMonth() + 1);
-    const day = pad(d.getDate());
-    const hours = pad(d.getHours());
-    return `${year}-${month}-${day} ${hours}:00`;
+    return formatBangkokDateTime(d);
   }
 
   /**
@@ -441,7 +437,7 @@ export class ThaiWaterBulkIngestionService {
                   rain3h,
                   rain6h,
                   rain24h,
-                  latestTime: new Date(latestItem.datetime),
+                  latestTime: parseThaiWaterDate(latestItem.datetime),
                 });
               }
             }
@@ -468,7 +464,8 @@ export class ThaiWaterBulkIngestionService {
           continue;
         }
 
-        const rawTime = obs.measureAt || obs.rainfallDatetime || new Date().toISOString();
+        const rawTime = obs.measureAt || obs.rainfallDatetime;
+        const rawDate = rawTime ? parseThaiWaterDate(rawTime) : null;
         const c60Data = hourlyRainMap.get(st.id);
         const c1440Rain24 = typeof obs.measureValue === "number" ? obs.measureValue : obs.rainfall24h ?? 0;
         const rain24h = c60Data ? Math.max(c1440Rain24, c60Data.rain24h) : c1440Rain24;
@@ -476,7 +473,22 @@ export class ThaiWaterBulkIngestionService {
         const rain3h = c60Data ? c60Data.rain3h : 0;
         const rain6h = c60Data ? c60Data.rain6h : 0;
         const rainToday = typeof obs.rainfallToday === "number" ? obs.rainfallToday : rain24h * 0.7;
-        const latestTime = c60Data?.latestTime || new Date(rawTime);
+
+        // Determine latest observation time:
+        // obs.measureAt from rainfall_c1440 is the primary station telemetry measurement.
+        // If c60Data has a valid time, we only adopt it if rawDate is missing or c60Time is strictly newer.
+        let latestTime: Date;
+        if (rawDate && !isNaN(rawDate.getTime())) {
+          if (c60Data?.latestTime && !isNaN(c60Data.latestTime.getTime()) && c60Data.latestTime.getTime() > rawDate.getTime()) {
+            latestTime = c60Data.latestTime;
+          } else {
+            latestTime = rawDate;
+          }
+        } else if (c60Data?.latestTime && !isNaN(c60Data.latestTime.getTime())) {
+          latestTime = c60Data.latestTime;
+        } else {
+          latestTime = new Date();
+        }
 
         let situationStatus = this.evaluateSituationStatus({
           isWaterlevel: false,
@@ -604,8 +616,8 @@ export class ThaiWaterBulkIngestionService {
           continue;
         }
 
-        const rawTime = obs.waterlevelDatetime || obs.measureAt || new Date().toISOString();
-        const latestTime = new Date(rawTime);
+        const rawTime = obs.waterlevelDatetime || obs.measureAt;
+        const latestTime = parseThaiWaterDate(rawTime);
         const waterLevelMsl = typeof obs.waterlevelMsl === "number" ? obs.waterlevelMsl : obs.measureValue ?? null;
         const prevMsl = typeof obs.waterlevelMslPrevious === "number" ? obs.waterlevelMslPrevious : null;
         const discharge = typeof obs.waterlevelDischarge === "number" ? obs.waterlevelDischarge : null;

@@ -3,6 +3,7 @@ import { env } from "../config/env";
 import { db } from "../db";
 import { basins, rainfallStations, telemetryLatest, waterlevelStations } from "../db/schema";
 import { FreshnessStatus, RainIntensity, SituationStatus, StationCurrentDataset, TrendDirection } from "../types";
+import { formatBangkokDate, formatBangkokDateTime, parseThaiWaterDate } from "../utils/date";
 import { r2Publisher } from "./r2PublisherService";
 import { r2Storage } from "./r2StorageService";
 
@@ -67,13 +68,7 @@ export class ThaiWaterIngestionService {
   }
 
   private formatDateTime(d: Date): string {
-    const pad = (n: number) => String(n).padStart(2, "0");
-    const year = d.getFullYear();
-    const month = pad(d.getMonth() + 1);
-    const day = pad(d.getDate());
-    const hours = pad(d.getHours());
-    // ThaiWater hourly rainfall requires :00 and waterlevel API requires round interval (multiples of 5/15)
-    return `${year}-${month}-${day} ${hours}:00`;
+    return formatBangkokDateTime(d);
   }
 
   /**
@@ -221,8 +216,8 @@ export class ThaiWaterIngestionService {
     const maxTime = new Date(merged[merged.length - 1].timestamp).getTime();
     const spanDays = (maxTime - minTime) / (1000 * 60 * 60 * 24);
 
-    const startDateStr = new Date(minTime).toISOString().split("T")[0];
-    const endDateStr = new Date(maxTime).toISOString().split("T")[0];
+    const startDateStr = formatBangkokDate(minTime);
+    const endDateStr = formatBangkokDate(maxTime);
 
     // Check if 7 days are complete
     if (spanDays >= 7) {
@@ -251,7 +246,7 @@ export class ThaiWaterIngestionService {
         stationId,
         basin: basinSlug,
         type: stationType,
-        startDate: new Date(recentDayObs[0]?.timestamp || maxTime).toISOString().split("T")[0],
+        startDate: formatBangkokDate(recentDayObs[0]?.timestamp || maxTime),
         totalObservations: recentDayObs.length,
         observations: recentDayObs,
         isCompleted: false,
@@ -297,7 +292,7 @@ export class ThaiWaterIngestionService {
     if (items.length === 0) return { ok: false };
 
     const latestItem = items[items.length - 1];
-    const latestTime = new Date(latestItem.datetime);
+    const latestTime = parseThaiWaterDate(latestItem.datetime);
     const rain1h = latestItem.value || 0;
 
     const last3Items = items.slice(-3);
@@ -356,7 +351,7 @@ export class ThaiWaterIngestionService {
 
     // 2. Append to 7-Day Chunk Timeseries on R2
     const observations = items.map((i) => ({
-      timestamp: new Date(i.datetime).toISOString(),
+      timestamp: parseThaiWaterDate(i.datetime).toISOString(),
       rainfall: i.value,
     }));
     await this.append7DayChunkHistory(basinSlug, st.id, "rainfall", observations);
@@ -436,7 +431,7 @@ export class ThaiWaterIngestionService {
     if (validPoints.length === 0) return false;
 
     const latestPoint = validPoints[validPoints.length - 1];
-    const latestTime = new Date(latestPoint.datetime);
+    const latestTime = parseThaiWaterDate(latestPoint.datetime);
     const stage = latestPoint.value;
     const discharge = latestPoint.discharge || null;
 
@@ -595,7 +590,7 @@ export class ThaiWaterIngestionService {
 
     // 2. Append to 7-Day Chunk Timeseries on R2
     const observations = validPoints.map((p) => ({
-      timestamp: new Date(p.datetime).toISOString(),
+      timestamp: parseThaiWaterDate(p.datetime).toISOString(),
       stage: p.value,
       discharge: p.discharge || null,
     }));

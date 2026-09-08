@@ -4,6 +4,7 @@ import { env } from "../config/env";
 import { db } from "../db";
 import { basins, rainfallStations, telemetryLatest, waterlevelStations } from "../db/schema";
 import { LocalizedString, SituationStatus } from "../types";
+import { getBangkokDateParts, getThaiDateString, getThaiTimeString } from "../utils/date";
 import { r2Storage } from "./r2StorageService";
 
 export interface SituationBulletin {
@@ -156,29 +157,11 @@ export class LLMBulletinService {
    * Format Thai Buddhist Date: e.g. "23 สิงหาคม 2569"
    */
   private getThaiDateString(d: Date = new Date()): string {
-    const thaiMonths = [
-      "มกราคม",
-      "กุมภาพันธ์",
-      "มีนาคม",
-      "เมษายน",
-      "พฤษภาคม",
-      "มิถุนายน",
-      "กรกฎาคม",
-      "สิงหาคม",
-      "กันยายน",
-      "ตุลาคม",
-      "พฤศจิกายน",
-      "ธันวาคม",
-    ];
-    const day = d.getDate();
-    const month = thaiMonths[d.getMonth()];
-    const year = d.getFullYear() + 543;
-    return `${day} ${month} ${year}`;
+    return getThaiDateString(d);
   }
 
   private getTimeString(d: Date = new Date()): string {
-    const pad = (n: number) => String(n).padStart(2, "0");
-    return `${pad(d.getHours())}:${pad(d.getMinutes())} น.`;
+    return getThaiTimeString(d);
   }
 
   /**
@@ -255,7 +238,9 @@ export class LLMBulletinService {
         : "normal";
 
     const now = new Date();
-    const docId = `bulletin-${b.slug}-${now.toISOString().slice(0, 10).replace(/-/g, "")}-${now.getHours().toString().padStart(2, "0")}00`;
+    const { year, month, day, hours } = getBangkokDateParts(now);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const docId = `bulletin-${b.slug}-${year}${pad(month)}${pad(day)}-${pad(hours)}00`;
 
     // Try generating with OpenAI Function Calling if client is available
     if (this.openaiClient) {

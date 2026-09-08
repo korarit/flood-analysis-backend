@@ -19,6 +19,8 @@ jobs:
     name: Generate Hydrological Bulletin V2
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      TZ: "Asia/Bangkok"
 
     steps:
       # Step 1: Checkout repository

@@ -17,6 +17,7 @@ import {
   StationRelationsDataset,
   StationSnapshotItem,
 } from "../types";
+import { formatBangkokDate } from "../utils/date";
 import { llmBulletinService } from "./llmBulletinService";
 import { r2Storage } from "./r2StorageService";
 
@@ -28,7 +29,7 @@ export class R2PublisherService {
   }
 
   private getTodayDateString(): string {
-    return new Date().toISOString().split("T")[0];
+    return formatBangkokDate();
   }
 
   /**
