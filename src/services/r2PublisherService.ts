@@ -648,12 +648,20 @@ export class R2PublisherService {
       await this.publishBasinStationsList(b.slug);
       await this.publishSpatialAndReports(b.slug);
 
-      // 3. Publish individual stations
+      // 3. Publish individual stations with controlled concurrency (25 workers)
       const { all: bStations } = await this.getStationsForBasin(b.id);
       stationsCount += bStations.length;
 
-      for (const st of bStations) {
-        await this.publishStationDatasets(st.id, teleMap);
+      const CONCURRENCY = 25;
+      for (let i = 0; i < bStations.length; i += CONCURRENCY) {
+        const batch = bStations.slice(i, i + CONCURRENCY);
+        await Promise.all(
+          batch.map((st) =>
+            this.publishStationDatasets(st.id, teleMap).catch((err) =>
+              console.warn(`⚠️ Warning publishing station ${st.id}:`, err.message)
+            )
+          )
+        );
       }
     }
 
