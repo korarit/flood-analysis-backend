@@ -1,8 +1,10 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { db } from "./index";
 import { basins, rainfallStations, stationRelations, telemetryLatest, waterlevelStations } from "./schema";
+import { r2Publisher } from "../services/r2PublisherService";
 import { stationImporter } from "../services/stationImporterService";
+import { getModelDatasetDir } from "../config/paths";
 
 export const initialBasins = [
   {
@@ -138,10 +140,11 @@ export async function seedDatabase() {
     }
     console.log(`✅ Seeded ${initialBasins.length} Basins`);
 
-    // 2. Check if flood-analysis-model/dataset exists to auto-import rich station files
-    const modelDatasetDir = join(process.cwd(), "..", "flood-analysis-model", "dataset");
-    if (existsSync(modelDatasetDir)) {
-      console.log(`📂 Found model dataset directory at ${modelDatasetDir}, importing stations...`);
+    // 2. Check if flood-analysis-model/dataset exists to auto-import rich station files and boundaries
+    const modelDatasetDir = getModelDatasetDir();
+
+    if (modelDatasetDir) {
+      console.log(`📂 Found model dataset directory at ${modelDatasetDir}, importing stations and boundaries...`);
       const basinFolders = readdirSync(modelDatasetDir, { withFileTypes: true })
         .filter((d) => d.isDirectory())
         .map((d) => d.name);
@@ -149,6 +152,7 @@ export async function seedDatabase() {
       for (const slug of basinFolders) {
         const stationDir = join(modelDatasetDir, slug, "station");
         const processedDir = join(modelDatasetDir, slug, "processed");
+        const gisDir = join(modelDatasetDir, slug, "gis");
 
         // Waterlevel
         const wlFile = join(stationDir, `${slug}_waterlevel_stations.json`);
@@ -172,9 +176,21 @@ export async function seedDatabase() {
           const data = JSON.parse(readFileSync(relFile, "utf-8"));
           await stationImporter.importRelations(data, slug, { skipR2: true });
         }
-        console.log(`  -> Basin [${slug}] stations & relations imported.`);
+
+        // Basin Boundary GeoJSON (_boundary.geojson)
+        const boundaryCandidate = r2Publisher.getModelBoundaryPath(slug);
+        if (boundaryCandidate && existsSync(boundaryCandidate)) {
+          try {
+            await r2Publisher.publishBasinBoundary(slug);
+            console.log(`  -> Basin [${slug}] boundary GeoJSON uploaded & registered.`);
+          } catch (bErr: any) {
+            console.warn(`  ⚠️ Could not upload boundary for ${slug}:`, bErr.message);
+          }
+        }
+
+        console.log(`  -> Basin [${slug}] stations, relations & boundary processed.`);
       }
-      console.log("✅ Finished importing stations and relations from dataset folders (DB only)");
+      console.log("✅ Finished importing stations, relations, and boundaries from dataset folders");
     }
 
     console.log("🎉 Seeding completed successfully!");

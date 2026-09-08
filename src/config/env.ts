@@ -27,6 +27,9 @@ const envSchema = z.object({
   R2_PUBLIC_BASE_URL: z.string().default("http://localhost:3001/r2-static"),
   R2_CUSTOM_ENDPOINT: z.string().optional().default(""),
   R2_LOCAL_FALLBACK: z.string().default("true").transform((v) => v === "true" || v === "1"),
+
+  // Model Dataset Directory (configurable path for local station/boundary ingestion)
+  MODEL_DATASET_DIR: z.string().optional().default(""),
 });
 
 export const env = envSchema.parse(process.env);

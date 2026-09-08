@@ -1,8 +1,9 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { and, eq, or } from "drizzle-orm";
 import { db } from "../db";
 import { basins, datasetRegistry, rainfallStations, stationRelations, telemetryLatest, waterlevelStations } from "../db/schema";
+import { getModelDatasetDir } from "../config/paths";
 import {
   BasinOverviewDataset,
   BasinsListDataset,
@@ -581,30 +582,21 @@ export class R2PublisherService {
     }
 
     // 4. spatial/boundary.geojson
-    const boundaryPath = `basin/${b.slug}/spatial/boundary.geojson`;
-    const modelGisBoundary = join(process.cwd(), "..", "flood-analysis-model", "dataset", b.slug, "gis", `${b.slug}_boundary.geojson`);
-    let boundaryGeoJson: any = null;
-
-    if (existsSync(modelGisBoundary)) {
-      try {
-        boundaryGeoJson = JSON.parse(readFileSync(modelGisBoundary, "utf-8"));
-      } catch {
-        boundaryGeoJson = null;
-      }
-    }
-
-    if (boundaryGeoJson) {
-      await r2Storage.putJson(boundaryPath, boundaryGeoJson, "public, max-age=604800, s-maxage=604800");
-      if (!b.boundaryGeojsonPath) {
-        await db.update(basins).set({ boundaryGeojsonPath: boundaryPath }).where(eq(basins.id, b.id));
-      }
+    try {
+      await this.publishBasinBoundary(b.slug);
+    } catch (err: any) {
+      console.warn(`⚠️ Warning auto-publishing boundary for ${b.slug}:`, err.message);
     }
 
     // 5. spatial/rivers.geojson
     const riversPath = `basin/${b.slug}/spatial/rivers.geojson`;
-    const modelRiverNetwork = join(process.cwd(), "..", "flood-analysis-model", "dataset", b.slug, "processed", "river_network_main.geojson");
-    const modelOsmWaterways = join(process.cwd(), "..", "flood-analysis-model", "dataset", b.slug, "gis", "osm_waterways.geojson");
-    const realRiverFile = existsSync(modelRiverNetwork) ? modelRiverNetwork : (existsSync(modelOsmWaterways) ? modelOsmWaterways : null);
+    const modelDir = getModelDatasetDir();
+    let realRiverFile: string | null = null;
+    if (modelDir) {
+      const p1 = join(modelDir, b.slug, "processed", "river_network_main.geojson");
+      const p2 = join(modelDir, b.slug, "gis", "osm_waterways.geojson");
+      realRiverFile = existsSync(p1) ? p1 : existsSync(p2) ? p2 : null;
+    }
 
     let riversGeoJson: any = null;
     if (realRiverFile) {
@@ -618,6 +610,122 @@ export class R2PublisherService {
     if (riversGeoJson) {
       await r2Storage.putJson(riversPath, riversGeoJson, "public, max-age=604800, s-maxage=604800");
     }
+  }
+
+  /**
+   * Helper to locate model GIS boundary file for a basin slug
+   */
+  public getModelBoundaryPath(slug: string): string | null {
+    const modelDir = getModelDatasetDir();
+    if (!modelDir) return null;
+
+    const basinGisDir = join(modelDir, slug, "gis");
+    const exactFile = join(basinGisDir, `${slug}_boundary.geojson`);
+    if (existsSync(exactFile)) return exactFile;
+
+    if (existsSync(basinGisDir)) {
+      try {
+        const files = readdirSync(basinGisDir);
+        const candidate = files.find((f) => f.endsWith("_boundary.geojson") || f === "boundary.geojson");
+        if (candidate) return join(basinGisDir, candidate);
+      } catch {
+        // ignore
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Publish boundary GeoJSON for a basin (uploads to R2, updates DB, registers dataset)
+   */
+  async publishBasinBoundary(
+    basinSlug: string,
+    geoJsonOverride?: any
+  ): Promise<{ success: boolean; r2Path: string; etag?: string; source: string }> {
+    const [b] = await db.select().from(basins).where(eq(basins.slug, basinSlug));
+    if (!b) {
+      throw new Error(`Basin with slug '${basinSlug}' not found in database`);
+    }
+
+    let boundaryGeoJson = geoJsonOverride;
+    let source = "override";
+
+    if (!boundaryGeoJson) {
+      const modelGisBoundary = this.getModelBoundaryPath(b.slug);
+      if (modelGisBoundary && existsSync(modelGisBoundary)) {
+        try {
+          boundaryGeoJson = JSON.parse(readFileSync(modelGisBoundary, "utf-8"));
+          source = `model:${modelGisBoundary}`;
+        } catch (err: any) {
+          console.warn(`⚠️ Failed to parse boundary file for ${b.slug} at ${modelGisBoundary}:`, err.message);
+        }
+      }
+    }
+
+    if (!boundaryGeoJson) {
+      throw new Error(`No boundary GeoJSON found for basin '${b.slug}'`);
+    }
+
+    const r2Key = `basin/${b.slug}/spatial/boundary.geojson`;
+    const putRes = await r2Storage.putJson(r2Key, boundaryGeoJson, "public, max-age=604800, s-maxage=604800");
+
+    // Update database basins record
+    await db
+      .update(basins)
+      .set({
+        boundaryGeojsonPath: r2Key,
+        updatedAt: new Date(),
+      })
+      .where(eq(basins.id, b.id));
+
+    // Register in dataset_registry
+    await this.registerDataset(b.id, "spatial_boundary", r2Key, putRes.etag);
+
+    return {
+      success: true,
+      r2Path: r2Key,
+      etag: putRes.etag,
+      source,
+    };
+  }
+
+  /**
+   * Auto publish boundaries for all active basins (or target basin)
+   */
+  async publishAllBasinBoundaries(targetBasinSlug?: string): Promise<{
+    success: boolean;
+    total: number;
+    uploaded: number;
+    failed: number;
+    results: Array<{ slug: string; success: boolean; r2Path?: string; error?: string }>;
+  }> {
+    const allBasins = targetBasinSlug
+      ? await db.select().from(basins).where(eq(basins.slug, targetBasinSlug))
+      : await db.select().from(basins);
+
+    const results: Array<{ slug: string; success: boolean; r2Path?: string; error?: string }> = [];
+    let uploaded = 0;
+    let failed = 0;
+
+    for (const b of allBasins) {
+      try {
+        const res = await this.publishBasinBoundary(b.slug);
+        results.push({ slug: b.slug, success: true, r2Path: res.r2Path });
+        uploaded++;
+      } catch (err: any) {
+        results.push({ slug: b.slug, success: false, error: err.message });
+        failed++;
+      }
+    }
+
+    return {
+      success: failed === 0,
+      total: allBasins.length,
+      uploaded,
+      failed,
+      results,
+    };
   }
 
   /**

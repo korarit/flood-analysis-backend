@@ -3,6 +3,7 @@ import { resolve } from "path";
 import { db, queryClient } from "../db";
 import { basins, rainfallStations, stationRelations, waterlevelStations, telemetryLatest } from "../db/schema";
 import { StationImporterService } from "../services/stationImporterService";
+import { getModelDatasetDir } from "../config/paths";
 import { eq, sql } from "drizzle-orm";
 
 async function main() {
@@ -11,7 +12,11 @@ async function main() {
   console.log("========================================================");
 
   const importer = new StationImporterService();
-  const modelDatasetDir = resolve(__dirname, "../../../flood-analysis-model/dataset");
+  const modelDatasetDir = getModelDatasetDir();
+  if (!modelDatasetDir) {
+    console.error("❌ Error: Model dataset directory not found or not configured in MODEL_DATASET_DIR.");
+    process.exit(1);
+  }
 
   const targetBasins = ["yom", "ping", "nan", "wang", "chao-phraya", "chi", "khong-north", "mun", "pa-sak"];
 

@@ -11,6 +11,7 @@ import { stationImporter } from "../services/stationImporterService";
 import { thaiWaterBulkIngestion } from "../services/thaiWaterBulkIngestion";
 import { thaiWaterIngestion } from "../services/thaiWaterIngestion";
 import { CreateBasinDto, RainfallStationArrayDto, WaterlevelStationArrayDto } from "../types/dto";
+import { getModelDatasetDir } from "../config/paths";
 
 const adminRouter = new Hono();
 
@@ -268,12 +269,12 @@ adminRouter.post("/relations/upload", async (c) => {
 
 /**
  * POST /api/admin/import-all-datasets
- * Auto scan and import all datasets from flood-analysis-model/dataset/
+ * Auto scan and import all datasets from model dataset directory
  */
 adminRouter.post("/import-all-datasets", async (c) => {
-  const modelDatasetDir = join(process.cwd(), "..", "flood-analysis-model", "dataset");
-  if (!existsSync(modelDatasetDir)) {
-    return c.json({ success: false, error: `Dataset directory not found: ${modelDatasetDir}` }, 404);
+  const modelDatasetDir = getModelDatasetDir();
+  if (!modelDatasetDir) {
+    return c.json({ success: false, error: "Model dataset directory not found or not configured in MODEL_DATASET_DIR" }, 404);
   }
 
   const results: any[] = [];
@@ -510,18 +511,7 @@ adminRouter.post("/basins/:slug/boundary", async (c) => {
       }, 400);
     }
 
-    // 1. Upload GeoJSON directly to R2 at basin/{slug}/spatial/boundary.geojson
-    const r2Key = `basin/${slug}/spatial/boundary.geojson`;
-    await r2Storage.putJson(r2Key, geoJsonData, "public, max-age=604800, s-maxage=604800");
-
-    // 2. Save only the file path in DB (null = not uploaded yet)
-    await db
-      .update(basins)
-      .set({
-        boundaryGeojsonPath: r2Key,
-        updatedAt: new Date(),
-      })
-      .where(eq(basins.slug, slug));
+    const pubRes = await r2Publisher.publishBasinBoundary(slug, geoJsonData);
 
     return c.json({
       success: true,
@@ -529,8 +519,27 @@ adminRouter.post("/basins/:slug/boundary", async (c) => {
       data: {
         basinId: basin.id,
         slug: basin.slug,
-        boundaryGeojsonPath: r2Key,
+        boundaryGeojsonPath: pubRes.r2Path,
+        etag: pubRes.etag,
       },
+    });
+  } catch (err: any) {
+    return c.json({ success: false, error: err.message }, 500);
+  }
+});
+
+/**
+ * POST /api/admin/basins/boundaries/sync-all
+ * Triggers automated sync of all basin boundaries from model (or ThaiWater fallback) to R2 and DB
+ */
+adminRouter.post("/basins/boundaries/sync-all", async (c) => {
+  const targetSlug = c.req.query("basin");
+  try {
+    const result = await r2Publisher.publishAllBasinBoundaries(targetSlug);
+    return c.json({
+      success: result.success,
+      message: `Processed ${result.total} basins: ${result.uploaded} uploaded, ${result.failed} failed`,
+      data: result,
     });
   } catch (err: any) {
     return c.json({ success: false, error: err.message }, 500);
