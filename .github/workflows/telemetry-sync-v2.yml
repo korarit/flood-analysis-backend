@@ -1,4 +1,4 @@
-name: ThaiWater Telemetry Ingestion & R2 Sync
+name: ThaiWater Telemetry Ingestion & R2 Sync V2
 
 on:
   # 1. Scheduled Ingestion (every 15 minutes, offset to avoid top-of-hour GitHub queue delays)
@@ -24,7 +24,7 @@ on:
 
 jobs:
   telemetry-sync:
-    name: Run Ingestion Engine
+    name: Run Ingestion Engine V2
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -70,7 +70,7 @@ jobs:
           MODE="${{ inputs.mode || github.event.inputs.mode }}"
           MODE="${MODE:-sync}"
 
-          echo "🚀 Running Telemetry Pipeline..."
+          echo "🚀 Running Telemetry Pipeline V2..."
           echo "   Mode:   $MODE"
           echo "   Basin:  $TARGET_BASIN"
 
