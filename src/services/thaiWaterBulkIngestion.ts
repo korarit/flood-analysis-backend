@@ -138,7 +138,7 @@ export class ThaiWaterBulkIngestionService {
     endpointPath: string,
     label: string,
     maxRetries: number = 3,
-    timeoutMs: number = 8000
+    timeoutMs: number = 15000
   ): Promise<T[] | null> {
     const url = `${this.baseUrl}${endpointPath}`;
 
