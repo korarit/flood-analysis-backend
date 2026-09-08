@@ -1,7 +1,7 @@
 name: ThaiWater Telemetry Ingestion & R2 Sync
 
 on:
-  # 1. Scheduled Ingestion (every 15 minutes)
+  # 1. Scheduled Ingestion (every 15 minutes) test
   schedule:
     - cron: "*/15 * * * *"
 
