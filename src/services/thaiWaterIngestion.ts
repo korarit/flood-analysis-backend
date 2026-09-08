@@ -433,10 +433,22 @@ export class ThaiWaterIngestionService {
     const stage = latestPoint.value;
     const discharge = latestPoint.discharge || null;
 
+    const groundLevel = mainData.groundLevel ?? st.groundLevel;
     const bankLevel = mainData.minBank || st.minBank;
     const criticalLevel = mainData.criticalLevel || bankLevel;
-    const warningLevel = mainData.warningLevel || (bankLevel ? bankLevel * 0.85 : null);
-    const watchLevel = bankLevel ? bankLevel * 0.7 : null;
+
+    let warningLevel: number | null = null;
+    let watchLevel: number | null = null;
+    if (bankLevel != null) {
+      if (groundLevel != null && bankLevel > groundLevel) {
+        const depth = bankLevel - groundLevel;
+        warningLevel = groundLevel + depth * 0.85;
+        watchLevel = groundLevel + depth * 0.7;
+      } else {
+        warningLevel = Math.max(0, bankLevel - 0.8);
+        watchLevel = Math.max(0, bankLevel - 1.5);
+      }
+    }
 
     let situationStatus: SituationStatus = "normal";
     if (stage !== null) {
@@ -451,7 +463,11 @@ export class ThaiWaterIngestionService {
 
     let storagePercent: number | null = null;
     if (bankLevel && stage !== null) {
-      storagePercent = Math.min(120, Math.max(0, Math.round((stage / bankLevel) * 100)));
+      if (groundLevel != null && bankLevel > groundLevel) {
+        storagePercent = Math.min(120, Math.max(0, Math.round(((stage - groundLevel) / (bankLevel - groundLevel)) * 100)));
+      } else {
+        storagePercent = Math.min(120, Math.max(0, Math.round((stage / bankLevel) * 100)));
+      }
     }
 
     // Upstream Rainfall Correlation (In-Memory from basin rain stations)

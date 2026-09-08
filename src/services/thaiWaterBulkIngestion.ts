@@ -212,21 +212,28 @@ export class ThaiWaterBulkIngestionService {
     criticalRain24h?: number;
   }): SituationStatus {
     if (opts.isWaterlevel) {
-      if (opts.diffWlBank !== null && opts.diffWlBank !== undefined) {
-        const isBankOverflow =
-          opts.diffWlBankText?.includes("ล้นตลิ่ง") ||
-          opts.diffWlBank <= 0;
-        if (isBankOverflow) return "critical";
-        if (opts.diffWlBank <= 0.5) return "warning";
-        if (opts.diffWlBank <= 1.0) return "watch";
-        return "normal";
-      }
+      // 1. Critical Overflow check
+      const isBankOverflow =
+        opts.diffWlBankText?.includes("ล้นตลิ่ง") ||
+        (opts.diffWlBank !== null && opts.diffWlBank !== undefined && opts.diffWlBank <= 0) ||
+        (opts.storagePercent !== null && opts.storagePercent !== undefined && opts.storagePercent >= 100);
+      if (isBankOverflow) return "critical";
+
+      // 2. Prioritize storagePercent (actual river channel capacity %)
+      // A station with low capacity (e.g. 15% - 20%) in a shallow creek is NOT high water
       if (opts.storagePercent !== null && opts.storagePercent !== undefined) {
-        if (opts.storagePercent >= 100) return "critical";
         if (opts.storagePercent >= 85) return "warning";
         if (opts.storagePercent >= 70) return "watch";
         return "normal";
       }
+
+      // 3. Fallback to diffWlBank ONLY when storagePercent is unavailable
+      if (opts.diffWlBank !== null && opts.diffWlBank !== undefined) {
+        if (opts.diffWlBank <= 0.5) return "warning";
+        if (opts.diffWlBank <= 1.0) return "watch";
+        return "normal";
+      }
+      return "normal";
     } else {
       const rain = opts.rain24h || 0;
       const crit = opts.criticalRain24h || 90.0;
@@ -498,7 +505,11 @@ export class ThaiWaterBulkIngestionService {
         const bankLevel = obs.minBank ?? st.minBank;
         let storagePercent = obs.storagePercent ?? null;
         if (storagePercent === null && bankLevel && waterLevelMsl !== null) {
-          storagePercent = Math.min(150, Math.max(0, Math.round((waterLevelMsl / bankLevel) * 100)));
+          if (groundLevel !== null && groundLevel !== undefined && bankLevel > groundLevel) {
+            storagePercent = Math.min(150, Math.max(0, Math.round(((waterLevelMsl - groundLevel) / (bankLevel - groundLevel)) * 100)));
+          } else {
+            storagePercent = Math.min(150, Math.max(0, Math.round((waterLevelMsl / bankLevel) * 100)));
+          }
         }
 
         let situationStatus = this.evaluateSituationStatus({

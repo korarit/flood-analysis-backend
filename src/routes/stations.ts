@@ -69,14 +69,26 @@ stationsRouter.get("/", async (c) => {
         },
         agency: { th: st.agencyNameTh || "", en: st.agencyNameEn || "" },
         river: isWL && st.riverName ? { th: st.riverName, en: st.riverName } : undefined,
-        location: {
-          lat: st.lat,
-          lon: st.lon,
-          groundLevelMsl: isWL ? st.groundLevel : null,
-          bankLevelMsl: isWL ? st.minBank : null,
-          warningLevelMsl: isWL && st.minBank ? st.minBank * 0.85 : null,
-          criticalLevelMsl: isWL ? st.minBank : null,
-        },
+        location: (() => {
+          const gMsl = isWL ? st.groundLevel : null;
+          const bMsl = isWL ? st.minBank : null;
+          let wMsl: number | null = null;
+          if (bMsl != null) {
+            if (gMsl != null && bMsl > gMsl) {
+              wMsl = Number((gMsl + (bMsl - gMsl) * 0.85).toFixed(2));
+            } else {
+              wMsl = Number(Math.max(0, bMsl - 0.8).toFixed(2));
+            }
+          }
+          return {
+            lat: st.lat,
+            lon: st.lon,
+            groundLevelMsl: gMsl,
+            bankLevelMsl: bMsl,
+            warningLevelMsl: wMsl,
+            criticalLevelMsl: bMsl,
+          };
+        })(),
         current: t
           ? {
               stage: t.stage,
@@ -160,21 +172,47 @@ stationsRouter.get("/:id", async (c) => {
         river: isWL && (st as typeof waterlevelStations.$inferSelect).riverName
           ? { th: (st as typeof waterlevelStations.$inferSelect).riverName!, en: (st as typeof waterlevelStations.$inferSelect).riverName! }
           : undefined,
-        location: {
-          lat: st.lat,
-          lon: st.lon,
-          groundLevelMsl: isWL ? (st as typeof waterlevelStations.$inferSelect).groundLevel : null,
-          bankLevelMsl: isWL ? (st as typeof waterlevelStations.$inferSelect).minBank : null,
-          warningLevelMsl: isWL && (st as typeof waterlevelStations.$inferSelect).minBank ? (st as typeof waterlevelStations.$inferSelect).minBank! * 0.85 : null,
-          criticalLevelMsl: isWL ? (st as typeof waterlevelStations.$inferSelect).minBank : null,
-        },
-        thresholds: {
-          bankLevelMsl: wl ? wl.minBank : null,
-          warningLevelMsl: wl && wl.minBank ? wl.minBank * 0.85 : null,
-          criticalLevelMsl: wl ? wl.minBank : null,
-          warningRain24h: rf ? rf.warningRain24h : null,
-          criticalRain24h: rf ? rf.criticalRain24h : null,
-        },
+        location: (() => {
+          const gMsl = isWL ? (st as typeof waterlevelStations.$inferSelect).groundLevel : null;
+          const bMsl = isWL ? (st as typeof waterlevelStations.$inferSelect).minBank : null;
+          let wMsl: number | null = null;
+          if (bMsl != null) {
+            if (gMsl != null && bMsl > gMsl) {
+              wMsl = Number((gMsl + (bMsl - gMsl) * 0.85).toFixed(2));
+            } else {
+              wMsl = Number(Math.max(0, bMsl - 0.8).toFixed(2));
+            }
+          }
+          return {
+            lat: st.lat,
+            lon: st.lon,
+            groundLevelMsl: gMsl,
+            bankLevelMsl: bMsl,
+            warningLevelMsl: wMsl,
+            criticalLevelMsl: bMsl,
+          };
+        })(),
+        thresholds: (() => {
+          const gMsl = wl ? wl.groundLevel : null;
+          const bMsl = wl ? wl.minBank : null;
+          let wMsl: number | null = null;
+          if (bMsl != null) {
+            if (gMsl != null && bMsl > gMsl) {
+              wMsl = Number((gMsl + (bMsl - gMsl) * 0.85).toFixed(2));
+            } else {
+              wMsl = Number(Math.max(0, bMsl - 0.8).toFixed(2));
+            }
+          }
+          return {
+            groundLevelMsl: gMsl,
+            bedLevelMsl: gMsl,
+            bankLevelMsl: bMsl,
+            warningLevelMsl: wMsl,
+            criticalLevelMsl: bMsl,
+            warningRain24h: rf ? rf.warningRain24h : null,
+            criticalRain24h: rf ? rf.criticalRain24h : null,
+          };
+        })(),
         current: t
           ? {
               stage: t.stage,

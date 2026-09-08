@@ -17,6 +17,8 @@ export interface StationLocation {
 }
 
 export interface StationThresholds {
+  groundLevelMsl?: number | null;
+  bedLevelMsl?: number | null;
   bankLevelMsl?: number | null;
   warningLevelMsl?: number | null;
   criticalLevelMsl?: number | null;
