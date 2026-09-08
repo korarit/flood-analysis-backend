@@ -88,6 +88,62 @@ export class R2StorageService {
   }
 
   /**
+   * Save a binary buffer (e.g. .gz compressed file) to R2 and local fallback
+   */
+  async putBuffer(
+    key: string,
+    buffer: Buffer | Uint8Array,
+    contentType: string = "application/gzip",
+    cacheControl: string = "public, max-age=604800, s-maxage=604800",
+    contentEncoding?: string
+  ): Promise<{ success: boolean; etag?: string; url: string }> {
+    const cleanKey = key.startsWith("/") ? key.slice(1) : key;
+    const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+
+    // 1. Mirror to local directory if enabled
+    if (env.R2_LOCAL_FALLBACK) {
+      try {
+        const localPath = join(this.localFallbackDir, cleanKey);
+        const parentDir = dirname(localPath);
+        if (!existsSync(parentDir)) {
+          mkdirSync(parentDir, { recursive: true });
+        }
+        writeFileSync(localPath, buf);
+      } catch (localErr) {
+        console.warn(`⚠️ Failed to write local fallback for key: ${cleanKey}`, localErr);
+      }
+    }
+
+    // 2. Upload to Cloudflare R2 if client is available
+    let etag: string | undefined;
+    if (hasR2Credentials() && r2Client) {
+      try {
+        const command = new PutObjectCommand({
+          Bucket: this.bucketName,
+          Key: cleanKey,
+          Body: buf,
+          ContentType: contentType,
+          CacheControl: cacheControl,
+          ...(contentEncoding ? { ContentEncoding: contentEncoding } : {}),
+        });
+        const res = await r2Client.send(command);
+        etag = res.ETag;
+      } catch (r2Err) {
+        console.error(`❌ Cloudflare R2 Upload failed for key: ${cleanKey}`, r2Err);
+        if (!env.R2_LOCAL_FALLBACK) {
+          throw r2Err;
+        }
+      }
+    }
+
+    return {
+      success: true,
+      etag,
+      url: this.getPublicUrl(cleanKey),
+    };
+  }
+
+  /**
    * Read JSON object from R2 (with local fallback)
    */
   async getJson<T = any>(key: string): Promise<T | null> {

@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { and, eq, or } from "drizzle-orm";
 import { db } from "../db";
 import { basins, datasetRegistry, rainfallStations, stationRelations, telemetryLatest, waterlevelStations } from "../db/schema";
@@ -166,6 +167,7 @@ export class R2PublisherService {
       description: { th: b.descriptionTh || "", en: b.descriptionEn || "" },
       areaKm2: b.areaKm2,
       boundaryGeojsonPath: b.boundaryGeojsonPath,
+      flowPathsGeojsonPath: b.flowPathsGeojsonPath,
       isActive: b.isActive,
       updatedAt: this.getNowIso(),
     };
@@ -738,6 +740,159 @@ export class R2PublisherService {
       try {
         const res = await this.publishBasinBoundary(b.slug);
         results.push({ slug: b.slug, success: true, r2Path: res.r2Path });
+        uploaded++;
+      } catch (err: any) {
+        results.push({ slug: b.slug, success: false, error: err.message });
+        failed++;
+      }
+    }
+
+    return {
+      success: failed === 0,
+      total: allBasins.length,
+      uploaded,
+      failed,
+      results,
+    };
+  }
+
+  /**
+   * Helper to locate model processed flow_paths file for a basin slug (.geojson.gz or .geojson)
+   */
+  public getModelFlowPathsPath(slug: string): { path: string; isGzip: boolean } | null {
+    const modelDir = getModelDatasetDir();
+    if (!modelDir) return null;
+
+    const basinProcessedDir = join(modelDir, slug, "processed");
+    const gzFile = join(basinProcessedDir, "flow_paths.geojson.gz");
+    if (existsSync(gzFile)) return { path: gzFile, isGzip: true };
+
+    const jsonFile = join(basinProcessedDir, "flow_paths.geojson");
+    if (existsSync(jsonFile)) return { path: jsonFile, isGzip: false };
+
+    if (existsSync(basinProcessedDir)) {
+      try {
+        const files = readdirSync(basinProcessedDir);
+        const gzCandidate = files.find((f) => f.includes("flow_paths") && f.endsWith(".geojson.gz"));
+        if (gzCandidate) return { path: join(basinProcessedDir, gzCandidate), isGzip: true };
+        const jsonCandidate = files.find((f) => f.includes("flow_paths") && f.endsWith(".geojson"));
+        if (jsonCandidate) return { path: join(basinProcessedDir, jsonCandidate), isGzip: false };
+      } catch {
+        // ignore
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Publish flow paths GeoJSON (.gz) for a basin (uploads to R2, updates DB, registers dataset)
+   */
+  async publishBasinFlowPaths(
+    basinSlug: string,
+    bufferOverride?: Buffer,
+    isOverrideGzipped: boolean = true
+  ): Promise<{ success: boolean; r2Path: string; etag?: string; source: string; featuresCount: number }> {
+    const [b] = await db.select().from(basins).where(eq(basins.slug, basinSlug));
+    if (!b) {
+      throw new Error(`Basin with slug '${basinSlug}' not found in database`);
+    }
+
+    let gzBuffer: Buffer | null = null;
+    let source = "override";
+    let featuresCount = 0;
+
+    if (bufferOverride) {
+      if (isOverrideGzipped) {
+        // Validate by unzipping in memory
+        const unzipped = gunzipSync(bufferOverride);
+        const parsed = JSON.parse(unzipped.toString("utf-8"));
+        if (!parsed || (parsed.type !== "FeatureCollection" && parsed.type !== "Feature")) {
+          throw new Error("Invalid GeoJSON format inside gzip archive. Expected FeatureCollection or Feature");
+        }
+        featuresCount = Array.isArray(parsed.features) ? parsed.features.length : 1;
+        gzBuffer = bufferOverride;
+      } else {
+        const parsed = JSON.parse(bufferOverride.toString("utf-8"));
+        if (!parsed || (parsed.type !== "FeatureCollection" && parsed.type !== "Feature")) {
+          throw new Error("Invalid GeoJSON format. Expected FeatureCollection or Feature");
+        }
+        featuresCount = Array.isArray(parsed.features) ? parsed.features.length : 1;
+        gzBuffer = gzipSync(bufferOverride);
+      }
+    } else {
+      const modelFile = this.getModelFlowPathsPath(b.slug);
+      if (modelFile && existsSync(modelFile.path)) {
+        source = `model:${modelFile.path}`;
+        const raw = readFileSync(modelFile.path);
+        if (modelFile.isGzip) {
+          const unzipped = gunzipSync(raw);
+          const parsed = JSON.parse(unzipped.toString("utf-8"));
+          featuresCount = Array.isArray(parsed.features) ? parsed.features.length : 1;
+          gzBuffer = raw;
+        } else {
+          const parsed = JSON.parse(raw.toString("utf-8"));
+          featuresCount = Array.isArray(parsed.features) ? parsed.features.length : 1;
+          gzBuffer = gzipSync(raw);
+        }
+      }
+    }
+
+    if (!gzBuffer) {
+      throw new Error(`No flow paths GeoJSON found for basin '${b.slug}'`);
+    }
+
+    const r2Key = `basin/${b.slug}/spatial/flow_paths.geojson.gz`;
+    const putRes = await r2Storage.putBuffer(
+      r2Key,
+      gzBuffer,
+      "application/gzip",
+      "public, max-age=604800, s-maxage=604800"
+    );
+
+    // Update database basins record
+    await db
+      .update(basins)
+      .set({
+        flowPathsGeojsonPath: r2Key,
+        updatedAt: new Date(),
+      })
+      .where(eq(basins.id, b.id));
+
+    // Register in dataset_registry
+    await this.registerDataset(b.id, "spatial_flow_paths", r2Key, putRes.etag);
+
+    return {
+      success: true,
+      r2Path: r2Key,
+      etag: putRes.etag,
+      source,
+      featuresCount,
+    };
+  }
+
+  /**
+   * Auto publish flow paths for all active basins (or target basin)
+   */
+  async publishAllBasinFlowPaths(targetBasinSlug?: string): Promise<{
+    success: boolean;
+    total: number;
+    uploaded: number;
+    failed: number;
+    results: Array<{ slug: string; success: boolean; r2Path?: string; featuresCount?: number; error?: string }>;
+  }> {
+    const allBasins = targetBasinSlug
+      ? await db.select().from(basins).where(eq(basins.slug, targetBasinSlug))
+      : await db.select().from(basins);
+
+    const results: Array<{ slug: string; success: boolean; r2Path?: string; featuresCount?: number; error?: string }> = [];
+    let uploaded = 0;
+    let failed = 0;
+
+    for (const b of allBasins) {
+      try {
+        const res = await this.publishBasinFlowPaths(b.slug);
+        results.push({ slug: b.slug, success: true, r2Path: res.r2Path, featuresCount: res.featuresCount });
         uploaded++;
       } catch (err: any) {
         results.push({ slug: b.slug, success: false, error: err.message });

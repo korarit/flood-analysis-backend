@@ -546,4 +546,82 @@ adminRouter.post("/basins/boundaries/sync-all", async (c) => {
   }
 });
 
+/**
+ * POST /api/admin/basins/:slug/flow-paths
+ * Upload flow_paths.geojson.gz (or .geojson) for a basin, publish directly to R2, and save file path in DB.
+ * In DB, flowPathsGeojsonPath will be set to 'basin/{slug}/spatial/flow_paths.geojson.gz'.
+ */
+adminRouter.post("/basins/:slug/flow-paths", async (c) => {
+  const slug = c.req.param("slug");
+
+  try {
+    const [basin] = await db.select().from(basins).where(eq(basins.slug, slug));
+    if (!basin) {
+      return c.json({ success: false, error: `Basin with slug '${slug}' not found` }, 404);
+    }
+
+    let buffer: Buffer;
+    let isGzip = false;
+    const contentType = c.req.header("content-type") || "";
+
+    if (contentType.includes("multipart/form-data")) {
+      const body = await c.req.parseBody();
+      const file = body["file"];
+      if (file instanceof File) {
+        const arr = await file.arrayBuffer();
+        buffer = Buffer.from(arr);
+        isGzip = file.name.endsWith(".gz") || (buffer.length > 2 && buffer[0] === 0x1f && buffer[1] === 0x8b);
+      } else if (typeof file === "string") {
+        buffer = Buffer.from(file, "utf-8");
+        isGzip = false;
+      } else {
+        return c.json({ success: false, error: "No file provided in form-data 'file' field" }, 400);
+      }
+    } else if (contentType.includes("gzip") || contentType.includes("octet-stream")) {
+      const arr = await c.req.arrayBuffer();
+      buffer = Buffer.from(arr);
+      isGzip = buffer.length > 2 && buffer[0] === 0x1f && buffer[1] === 0x8b;
+    } else {
+      const json = await c.req.json();
+      buffer = Buffer.from(JSON.stringify(json), "utf-8");
+      isGzip = false;
+    }
+
+    const pubRes = await r2Publisher.publishBasinFlowPaths(slug, buffer, isGzip);
+
+    return c.json({
+      success: true,
+      message: `Successfully uploaded flow paths GeoJSON (.gz) for '${slug}' to R2 and updated DB`,
+      data: {
+        basinId: basin.id,
+        slug: basin.slug,
+        flowPathsGeojsonPath: pubRes.r2Path,
+        etag: pubRes.etag,
+        featuresCount: pubRes.featuresCount,
+      },
+    });
+  } catch (err: any) {
+    return c.json({ success: false, error: err.message }, 500);
+  }
+});
+
+/**
+ * POST /api/admin/basins/flow-paths/sync-all
+ * Triggers automated sync of all basin flow paths from model dataset to R2 and DB
+ */
+adminRouter.post("/basins/flow-paths/sync-all", async (c) => {
+  const targetSlug = c.req.query("basin");
+  try {
+    const result = await r2Publisher.publishAllBasinFlowPaths(targetSlug);
+    return c.json({
+      success: result.success,
+      message: `Processed ${result.total} basins: ${result.uploaded} uploaded, ${result.failed} failed`,
+      data: result,
+    });
+  } catch (err: any) {
+    return c.json({ success: false, error: err.message }, 500);
+  }
+});
+
 export { adminRouter };
+

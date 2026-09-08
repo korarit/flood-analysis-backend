@@ -13,6 +13,9 @@ export const basins = pgTable("basins", {
   // Path to boundary GeoJSON on R2 / storage (e.g. 'basin/{slug}/spatial/boundary.geojson').
   // ค่า null หมายถึงยังไม่ได้ upload ไฟล์ GeoJSON ขอบเขตลุ่มน้ำ
   boundaryGeojsonPath: text("boundary_geojson_path"),
+  // Path to flow paths compressed GeoJSON on R2 / storage (e.g. 'basin/{slug}/spatial/flow_paths.geojson.gz').
+  // ค่า null หมายถึงยังไม่ได้ upload ไฟล์ GeoJSON โครงข่ายเส้นทางน้ำ
+  flowPathsGeojsonPath: text("flow_paths_geojson_path"),
   status: varchar("status", { length: 32 }).default("active").notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),

@@ -48,6 +48,13 @@ app.get("/r2-static/*", (c) => {
   const localFile = join(process.cwd(), ".r2-local", filePath);
 
   if (existsSync(localFile)) {
+    if (filePath.endsWith(".gz")) {
+      const buffer = readFileSync(localFile);
+      return c.body(buffer, 200, {
+        "Content-Type": "application/gzip",
+        "Cache-Control": "public, max-age=604800",
+      });
+    }
     const isGeoJson = filePath.endsWith(".geojson");
     const content = readFileSync(localFile, "utf-8");
     return c.text(content, 200, {

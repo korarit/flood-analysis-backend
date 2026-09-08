@@ -154,6 +154,7 @@ basinsRouter.get("/:slug", async (c) => {
       statusSummary,
       isActive: b.isActive,
       boundaryGeojsonPath: b.boundaryGeojsonPath,
+      flowPathsGeojsonPath: b.flowPathsGeojsonPath,
       lastUpdated: b.updatedAt.toISOString(),
     };
 

@@ -28,6 +28,7 @@ export interface BasinDetail extends BasinSummary {
   rainfallStationsCount: number;
   statusSummary: BasinStatusSummary;
   boundaryGeojsonPath?: string | null;
+  flowPathsGeojsonPath?: string | null;
 }
 
 export interface BasinsListDataset {
