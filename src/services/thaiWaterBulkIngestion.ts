@@ -131,6 +131,15 @@ export class ThaiWaterBulkIngestionService {
     };
   }
 
+  private formatDateTime(d: Date): string {
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const year = d.getFullYear();
+    const month = pad(d.getMonth() + 1);
+    const day = pad(d.getDate());
+    const hours = pad(d.getHours());
+    return `${year}-${month}-${day} ${hours}:00`;
+  }
+
   /**
    * Fetch with timeout and exponential backoff retry
    */
@@ -382,7 +391,72 @@ export class ThaiWaterBulkIngestionService {
         }
       >();
 
-      // 3.1 Process Rainfall Stations
+      // 3.1 Concurrent Connection Pool (30 workers) for c60 hourly rainfall graphs
+      const hourlyRainMap = new Map<
+        string,
+        {
+          rain1h: number;
+          rain3h: number;
+          rain6h: number;
+          rain24h: number;
+          latestTime: Date;
+        }
+      >();
+
+      const endStr = this.formatDateTime(new Date());
+      const startStr = this.formatDateTime(new Date(Date.now() - 24 * 60 * 60 * 1000));
+      const C60_CONCURRENCY = 30;
+      const tC60 = Date.now();
+
+      let c60Index = 0;
+      const c60Worker = async () => {
+        while (c60Index < rainList.length) {
+          const idx = c60Index++;
+          const st = rainList[idx];
+          const url = `${this.baseUrl}/data/platform/v1/public/rainfall_c60/graph?timezone=7&stationId=${st.id}&limit=-1&sort=measureAt&interval=hourly&startDate=${encodeURIComponent(startStr)}&endDate=${encodeURIComponent(endStr)}`;
+
+          try {
+            const res = await fetch(url, {
+              headers: this.getRequestHeaders(),
+            });
+
+            if (res.ok) {
+              const json = (await res.json()) as { data?: Array<{ datetime: string; value: number | null }> };
+              const validItems = (json.data || []).filter((d) => d.value !== null);
+              if (validItems.length > 0) {
+                const latestItem = validItems[validItems.length - 1];
+                const rain1h = Number(latestItem.value) || 0;
+                const rain3h = Number(
+                  validItems.slice(-3).reduce((acc, curr) => acc + (Number(curr.value) || 0), 0).toFixed(1)
+                );
+                const rain6h = Number(
+                  validItems.slice(-6).reduce((acc, curr) => acc + (Number(curr.value) || 0), 0).toFixed(1)
+                );
+                const rain24h = Number(
+                  validItems.slice(-24).reduce((acc, curr) => acc + (Number(curr.value) || 0), 0).toFixed(1)
+                );
+
+                hourlyRainMap.set(st.id, {
+                  rain1h,
+                  rain3h,
+                  rain6h,
+                  rain24h,
+                  latestTime: new Date(latestItem.datetime),
+                });
+              }
+            }
+          } catch {
+            // Graceful fallback to c1440 bulk
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: C60_CONCURRENCY }, () => c60Worker()));
+      console.log(
+        `🌧️ [${b.slug}] Fetched c60 hourly data for ${hourlyRainMap.size}/${rainList.length} stations in ${Date.now() - tC60}ms (30 workers)`
+      );
+
+      // 3.2 Process Rainfall Stations
       for (const st of rainList) {
         const obs =
           rainById.get(st.id) ||
@@ -395,14 +469,16 @@ export class ThaiWaterBulkIngestionService {
         }
 
         const rawTime = obs.measureAt || obs.rainfallDatetime || new Date().toISOString();
-        const latestTime = new Date(rawTime);
-        const rain24h = typeof obs.measureValue === "number" ? obs.measureValue : obs.rainfall24h ?? 0;
+        const c60Data = hourlyRainMap.get(st.id);
+        const c1440Rain24 = typeof obs.measureValue === "number" ? obs.measureValue : obs.rainfall24h ?? 0;
+        const rain24h = c60Data ? Math.max(c1440Rain24, c60Data.rain24h) : c1440Rain24;
+        const rain1h = c60Data ? c60Data.rain1h : 0;
+        const rain3h = c60Data ? c60Data.rain3h : 0;
+        const rain6h = c60Data ? c60Data.rain6h : 0;
         const rainToday = typeof obs.rainfallToday === "number" ? obs.rainfallToday : rain24h * 0.7;
-        const rain1h = 0;
-        const rain3h = 0;
-        const rain6h = 0;
+        const latestTime = c60Data?.latestTime || new Date(rawTime);
 
-        const situationStatus = this.evaluateSituationStatus({
+        let situationStatus = this.evaluateSituationStatus({
           isWaterlevel: false,
           rain24h,
           warningRain24h: st.warningRain24h || 35.0,
@@ -411,15 +487,18 @@ export class ThaiWaterBulkIngestionService {
 
         let alertReasonTh: string | null = null;
         let alertReasonEn: string | null = null;
-        if (situationStatus === "critical") {
-          alertReasonTh = `ฝนตกหนักมากสะสม 24 ชม. ${rain24h.toFixed(1)} มม. เสี่ยงน้ำท่วมฉับพลันและน้ำป่าไหลหลาก`;
-          alertReasonEn = `Critical heavy rainfall: 24h ${rain24h.toFixed(1)} mm. High flash flood risk.`;
-        } else if (situationStatus === "warning") {
-          alertReasonTh = `ฝนตกหนักสะสม 24 ชม. ${rain24h.toFixed(1)} มม. โปรดเฝ้าระวังน้ำท่วมขังและน้ำหลาก`;
-          alertReasonEn = `Heavy rainfall alert: 24h ${rain24h.toFixed(1)} mm. Flood watch advised.`;
-        } else if (situationStatus === "watch") {
-          alertReasonTh = `มีฝนตกต่อเนื่องสะสม 24 ชม. ${rain24h.toFixed(1)} มม.`;
-          alertReasonEn = `Continuous moderate-to-heavy rain: 24h ${rain24h.toFixed(1)} mm.`;
+        if (rain24h >= 150.0 || rain3h >= 100.0 || (rain24h >= 100.0 && (rain3h >= 30.0 || rain1h >= 30.0))) {
+          situationStatus = "critical";
+          alertReasonTh = `ฝนตกหนักมากสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (3 ชม. ${rain3h.toFixed(1)} มม.) เสี่ยงน้ำท่วมฉับพลันและน้ำป่าไหลหลาก`;
+          alertReasonEn = `Critical heavy rainfall: 24h ${rain24h.toFixed(1)} mm (3h ${rain3h.toFixed(1)} mm). High flash flood risk.`;
+        } else if (rain24h >= 100.0 || (rain24h >= 90.0 && rain3h >= 20.0) || rain3h >= 50.0 || rain1h >= 30.0) {
+          situationStatus = "warning";
+          alertReasonTh = `ฝนตกหนักสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (3 ชม. ${rain3h.toFixed(1)} มม.) โปรดเฝ้าระวังน้ำท่วมขังและน้ำหลาก`;
+          alertReasonEn = `Heavy rainfall alert: 24h ${rain24h.toFixed(1)} mm (3h ${rain3h.toFixed(1)} mm). Flood watch advised.`;
+        } else if (rain24h >= 35.0 || rain3h >= 20.0 || rain1h >= 15.0) {
+          if (situationStatus === "normal") situationStatus = "watch";
+          alertReasonTh = `มีฝนตกต่อเนื่องสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (3 ชม. ${rain3h.toFixed(1)} มม.)`;
+          alertReasonEn = `Continuous moderate-to-heavy rain: 24h ${rain24h.toFixed(1)} mm (3h ${rain3h.toFixed(1)} mm).`;
         }
 
         const freshness = this.calculateFreshness(latestTime);
