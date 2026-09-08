@@ -284,7 +284,10 @@ export class ThaiWaterIngestionService {
   async syncRainfallStation(
     st: typeof rainfallStations.$inferSelect,
     basinSlug: string
-  ): Promise<{ ok: boolean; latestRain?: { rain1h: number; rain3h: number; rain24h: number; lat: number; nameTh: string; nameEn: string } }> {
+  ): Promise<{
+    ok: boolean;
+    latestRain?: { stationId: string; rain1h: number; rain3h: number; rain24h: number; lat: number; nameTh: string; nameEn: string };
+  }> {
     const rainRes = await this.fetchRainfallGraph(st.id);
     if (!rainRes || !rainRes.data || rainRes.data.length === 0) {
       return { ok: false };
@@ -397,6 +400,7 @@ export class ThaiWaterIngestionService {
     return {
       ok: true,
       latestRain: {
+        stationId: st.id,
         rain1h,
         rain3h,
         rain24h,
@@ -417,7 +421,10 @@ export class ThaiWaterIngestionService {
   async syncWaterlevelStation(
     st: typeof waterlevelStations.$inferSelect,
     basinSlug: string,
-    basinRainMap: Array<{ rain1h: number; rain3h: number; rain24h: number; lat: number; nameTh: string; nameEn: string }>
+    basinRainMap: Map<
+      string,
+      { stationId: string; rain1h: number; rain3h: number; rain24h: number; lat: number; nameTh: string; nameEn: string }
+    >
   ): Promise<boolean> {
     const wlRes = await this.fetchWaterLevelGraph(st.id);
     if (!wlRes || !wlRes.data || wlRes.data.length === 0) {
@@ -470,24 +477,75 @@ export class ThaiWaterIngestionService {
       }
     }
 
-    // Upstream Rainfall Correlation (In-Memory from basin rain stations)
+    // Upstream Hydrological Correlation (from relations_frontend.json & station_relations)
     let isUpstreamAlert = false;
     let upstreamAlertTh: string | null = null;
     let upstreamAlertEn: string | null = null;
 
-    const heavyUpstream = basinRainMap.filter((r) => {
-      const isUpstreamReach = r.lat >= st.lat - 0.05;
-      return isUpstreamReach && (r.rain24h >= 80.0 || r.rain3h >= 20.0);
-    });
+    const metaRelations = (st.rawMetadata as Record<string, any>)?.relations;
+    const influencingRainList: any[] = Array.isArray(metaRelations?.influencingRainfallStations)
+      ? metaRelations.influencingRainfallStations
+      : [];
 
-    if (heavyUpstream.length > 0) {
-      const topRain = heavyUpstream.sort((a, b) => b.rain24h - a.rain24h)[0];
+    const triggeredRainInfluencers: Array<{
+      stationId: string;
+      nameTh: string;
+      nameEn: string;
+      rain24h: number;
+      rain3h: number;
+      warningTh24: number;
+      drySoilTh24: number;
+      distanceKm: number | null;
+      travelTimeHours: number | null;
+      severity: number;
+    }> = [];
+
+    for (const inf of influencingRainList) {
+      const rfId = String(inf.stationId || "").trim();
+      if (!rfId) continue;
+
+      const rainObs = basinRainMap.get(rfId);
+      if (!rainObs || rainObs.rain24h < 35.0) continue;
+
+      const warningTh24 = Number(inf.rainfallThresholds?.["24h"]?.warningRainMm) || 80.0;
+      const drySoilTh24 = Number(inf.rainfallThresholds?.["24h"]?.drySoilWarningRainMm) || 120.0;
+      const warningTh3 = Number(inf.rainfallThresholds?.["3h"]?.warningRainMm) || 35.0;
+
+      const isTriggered =
+        (rainObs.rain24h >= warningTh24 && rainObs.rain24h >= 50.0) ||
+        (rainObs.rain3h >= warningTh3 && rainObs.rain3h >= 30.0) ||
+        rainObs.rain24h >= 80.0;
+
+      if (isTriggered) {
+        triggeredRainInfluencers.push({
+          stationId: rfId,
+          nameTh: rainObs.nameTh || inf.stationName || rfId,
+          nameEn: rainObs.nameEn || rainObs.nameTh || inf.stationName || rfId,
+          rain24h: rainObs.rain24h,
+          rain3h: rainObs.rain3h,
+          warningTh24,
+          drySoilTh24,
+          distanceKm: inf.distanceKm != null ? Number(inf.distanceKm) : null,
+          travelTimeHours: inf.travelTimeHours != null ? Number(inf.travelTimeHours) : null,
+          severity: rainObs.rain24h / warningTh24,
+        });
+      }
+    }
+
+    if (triggeredRainInfluencers.length > 0) {
+      const topRain = triggeredRainInfluencers.sort((a, b) => b.severity - a.severity)[0];
       isUpstreamAlert = true;
-      upstreamAlertTh = `ขณะนี้มีฝนตกหนักที่ต้นน้ำ (สถานี ${topRain.nameTh} ฝน 24 ชม. ${topRain.rain24h.toFixed(1)} มม.) โปรดเฝ้าระวังมวลน้ำหลาก`;
-      upstreamAlertEn = `Heavy upstream rainfall at ${topRain.nameEn} (24h: ${topRain.rain24h.toFixed(1)} mm). Watch for downstream runoff.`;
+
+      const distTh = topRain.distanceKm != null ? ` ห่าง ${topRain.distanceKm.toFixed(1)} กม.` : "";
+      const distEn = topRain.distanceKm != null ? ` (${topRain.distanceKm.toFixed(1)} km away)` : "";
+      const travelTh = topRain.travelTimeHours != null ? ` คาดมวลน้ำเดินทางถึงใน ~${topRain.travelTimeHours.toFixed(1)} ชม.` : "";
+      const travelEn = topRain.travelTimeHours != null ? ` Runoff expected in ~${topRain.travelTimeHours.toFixed(1)} hrs.` : "";
+
+      upstreamAlertTh = `ขณะนี้มีฝนตกหนักที่ต้นน้ำ (สถานี ${topRain.nameTh} ฝน 24 ชม. ${topRain.rain24h.toFixed(1)} มม.${distTh}) โปรดเฝ้าระวังมวลน้ำหลาก${travelTh}`;
+      upstreamAlertEn = `Heavy upstream rainfall at ${topRain.nameEn} (24h: ${topRain.rain24h.toFixed(1)} mm${distEn}). Watch for downstream runoff.${travelEn}`;
 
       if (situationStatus === "normal") {
-        situationStatus = topRain.rain24h >= 120.0 ? "warning" : "watch";
+        situationStatus = (topRain.rain24h >= topRain.drySoilTh24 || topRain.rain24h >= 120.0) ? "warning" : "watch";
       }
     }
 
@@ -614,7 +672,10 @@ export class ThaiWaterIngestionService {
       let basinSynced = 0;
       let basinFailed = 0;
 
-      const basinRainObservations: Array<{ rain1h: number; rain3h: number; rain24h: number; lat: number; nameTh: string; nameEn: string }> = [];
+      const basinRainMap = new Map<
+        string,
+        { stationId: string; rain1h: number; rain3h: number; rain24h: number; lat: number; nameTh: string; nameEn: string }
+      >();
 
       // 1. Sync Rainfall Stations for this basin
       for (const st of rainList) {
@@ -624,7 +685,8 @@ export class ThaiWaterIngestionService {
             synced++;
             basinSynced++;
             if (res.latestRain) {
-              basinRainObservations.push(res.latestRain);
+              basinRainMap.set(st.id, res.latestRain);
+              if (st.oldcode) basinRainMap.set(st.oldcode.toLowerCase(), res.latestRain);
             }
           } else {
             failed++;
@@ -640,7 +702,7 @@ export class ThaiWaterIngestionService {
       // 2. Sync Waterlevel Stations for this basin
       for (const st of waterList) {
         try {
-          const ok = await this.syncWaterlevelStation(st, b.slug, basinRainObservations);
+          const ok = await this.syncWaterlevelStation(st, b.slug, basinRainMap);
           if (ok) {
             synced++;
             basinSynced++;
