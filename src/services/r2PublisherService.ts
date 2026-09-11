@@ -79,6 +79,59 @@ const BASIN_MAIN_RIVERS: Record<string, Array<{ th: string; en: string }>> = {
     { th: "แม่น้ำอิง", en: "Ing River" },
   ],
 };
+/**
+ * Hybrid Percentage-Based Basin Overall Situation Status Evaluation:
+ * - Differentiates Water Level (river channel inundation) vs Rainfall (risk indicator)
+ * - Critical: WL critical >= 8.0% or all critical >= 8.0% or (WL critical >= 4% & alert >= 12%)
+ * - Warning: WL (critical + warning) >= 10.0% or WL critical >= 3.0% or RF warning >= 15.0% or all alert >= 10.0%
+ * - Watch: WL (critical + warning + watch) >= 10.0% or WL alert > 0 or RF watch/warning >= 5.0% or all elevated >= 3.0%
+ * - Normal: Otherwise
+ */
+export function evaluateBasinOverallStatus(stats: {
+  wlTotal: number;
+  wlCrit: number;
+  wlWarn: number;
+  wlWatch: number;
+  rfTotal: number;
+  rfCrit: number;
+  rfWarn: number;
+  rfWatch: number;
+}): SituationStatus {
+  const total = stats.wlTotal + stats.rfTotal;
+  if (total === 0) return "normal";
+
+  const wlCritPct = stats.wlTotal > 0 ? (stats.wlCrit / stats.wlTotal) * 100 : 0;
+  const wlWarnPct = stats.wlTotal > 0 ? (stats.wlWarn / stats.wlTotal) * 100 : 0;
+  const wlWatchPct = stats.wlTotal > 0 ? (stats.wlWatch / stats.wlTotal) * 100 : 0;
+  const wlAlertPct = wlCritPct + wlWarnPct;
+  const wlElevatedPct = wlAlertPct + wlWatchPct;
+
+  const rfCritPct = stats.rfTotal > 0 ? (stats.rfCrit / stats.rfTotal) * 100 : 0;
+  const rfWarnPct = stats.rfTotal > 0 ? (stats.rfWarn / stats.rfTotal) * 100 : 0;
+  const rfAlertPct = rfCritPct + rfWarnPct;
+
+  const allCrit = stats.wlCrit + stats.rfCrit;
+  const allWarn = stats.wlWarn + stats.rfWarn;
+  const allCritPct = (allCrit / total) * 100;
+  const allAlertPct = ((allCrit + allWarn) / total) * 100;
+
+  // 1. Critical (วิกฤต): เกณฑ์ 8%
+  if (wlCritPct >= 8.0 || (wlCritPct >= 4.0 && wlAlertPct >= 12.0) || allCritPct >= 8.0) {
+    return "critical";
+  }
+
+  // 2. Warning (เตือนภัย):
+  if (wlAlertPct >= 10.0 || wlCritPct >= 3.0 || rfAlertPct >= 15.0 || allAlertPct >= 10.0) {
+    return "warning";
+  }
+
+  // 3. Watch (เฝ้าระวัง):
+  if (wlElevatedPct >= 10.0 || wlAlertPct > 0 || rfAlertPct >= 5.0 || allAlertPct >= 3.0) {
+    return "watch";
+  }
+
+  return "normal";
+}
 
 export class R2PublisherService {
   private schemaVersion = "1.0";
@@ -290,14 +343,38 @@ export class R2PublisherService {
         if (t?.rainfall24h && t.rainfall24h >= 35) heavyRainCount++;
       }
 
-      const overallStatus: SituationStatus =
-        criticalCount > 0
-          ? "critical"
-          : warningCount > 0
-          ? "warning"
-          : watchCount > 0
-          ? "watch"
-          : "normal";
+      let wlCrit = 0;
+      let wlWarn = 0;
+      let wlWatch = 0;
+      for (const st of bWl) {
+        const t = teleMap.get(st.id);
+        const status = (t?.situationStatus as SituationStatus) || "normal";
+        if (status === "critical") wlCrit++;
+        else if (status === "warning") wlWarn++;
+        else if (status === "watch") wlWatch++;
+      }
+
+      let rfCrit = 0;
+      let rfWarn = 0;
+      let rfWatch = 0;
+      for (const st of bRf) {
+        const t = teleMap.get(st.id);
+        const status = (t?.situationStatus as SituationStatus) || "normal";
+        if (status === "critical") rfCrit++;
+        else if (status === "warning") rfWarn++;
+        else if (status === "watch") rfWatch++;
+      }
+
+      const overallStatus = evaluateBasinOverallStatus({
+        wlTotal: bWl.length,
+        wlCrit,
+        wlWarn,
+        wlWatch,
+        rfTotal: bRf.length,
+        rfCrit,
+        rfWarn,
+        rfWatch,
+      });
 
       // Distinct provinces covered by stations in this basin
       const provinceMap = new Map<string, string>();
@@ -458,14 +535,34 @@ export class R2PublisherService {
       if (t?.rainfall24h && t.rainfall24h >= 35) heavyRainCount++;
     }
 
-    const overallStatus: SituationStatus =
-      criticalCount > 0
-        ? "critical"
-        : warningCount > 0
-        ? "warning"
-        : watchCount > 0
-        ? "watch"
-        : "normal";
+    let wlCrit = 0, wlWarn = 0, wlWatch = 0;
+    for (const st of wlStations) {
+      const t = teleMap.get(st.id);
+      const status = (t?.situationStatus as SituationStatus) || "normal";
+      if (status === "critical") wlCrit++;
+      else if (status === "warning") wlWarn++;
+      else if (status === "watch") wlWatch++;
+    }
+
+    let rfCrit = 0, rfWarn = 0, rfWatch = 0;
+    for (const st of rfStations) {
+      const t = teleMap.get(st.id);
+      const status = (t?.situationStatus as SituationStatus) || "normal";
+      if (status === "critical") rfCrit++;
+      else if (status === "warning") rfWarn++;
+      else if (status === "watch") rfWatch++;
+    }
+
+    const overallStatus: SituationStatus = evaluateBasinOverallStatus({
+      wlTotal: wlStations.length,
+      wlCrit,
+      wlWarn,
+      wlWatch,
+      rfTotal: rfStations.length,
+      rfCrit,
+      rfWarn,
+      rfWatch,
+    });
 
     const statusSummary: BasinStatusSummary = {
       normalCount,

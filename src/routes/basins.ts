@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { basins, telemetryLatest } from "../db/schema";
 import { BasinDetail, BasinStatusSummary, BasinSummary, SituationStatus } from "../types";
-import { r2Publisher } from "../services/r2PublisherService";
+import { evaluateBasinOverallStatus, r2Publisher } from "../services/r2PublisherService";
 
 const basinsRouter = new Hono();
 
@@ -28,21 +28,34 @@ basinsRouter.get("/", async (c) => {
       const bStations = allStations.filter((s) => s.basinId === b.id);
       const bWl = allWl.filter((s) => s.basinId === b.id);
       const bRf = allRf.filter((s) => s.basinId === b.id);
-      let overallStatus: SituationStatus = "normal";
-
-      for (const st of bStations) {
+      let wlCrit = 0, wlWarn = 0, wlWatch = 0;
+      for (const st of bWl) {
         const t = teleMap.get(st.id);
         const status = (t?.situationStatus as SituationStatus) || "normal";
-        if (status === "critical") {
-          overallStatus = "critical";
-          break;
-        }
-        if (status === "warning") {
-          overallStatus = "warning";
-        } else if (status === "watch" && overallStatus === "normal") {
-          overallStatus = "watch";
-        }
+        if (status === "critical") wlCrit++;
+        else if (status === "warning") wlWarn++;
+        else if (status === "watch") wlWatch++;
       }
+
+      let rfCrit = 0, rfWarn = 0, rfWatch = 0;
+      for (const st of bRf) {
+        const t = teleMap.get(st.id);
+        const status = (t?.situationStatus as SituationStatus) || "normal";
+        if (status === "critical") rfCrit++;
+        else if (status === "warning") rfWarn++;
+        else if (status === "watch") rfWatch++;
+      }
+
+      const overallStatus = evaluateBasinOverallStatus({
+        wlTotal: bWl.length,
+        wlCrit,
+        wlWarn,
+        wlWatch,
+        rfTotal: bRf.length,
+        rfCrit,
+        rfWarn,
+        rfWatch,
+      });
 
       return {
         id: b.id,
@@ -125,14 +138,34 @@ basinsRouter.get("/:slug", async (c) => {
       if (t?.rainfall24h && t.rainfall24h >= 35) heavyRainCount++;
     }
 
-    const overallStatus: SituationStatus =
-      criticalCount > 0
-        ? "critical"
-        : warningCount > 0
-        ? "warning"
-        : watchCount > 0
-        ? "watch"
-        : "normal";
+    let wlCrit = 0, wlWarn = 0, wlWatch = 0;
+    for (const st of wlStations) {
+      const t = teleMap.get(st.id);
+      const status = (t?.situationStatus as SituationStatus) || "normal";
+      if (status === "critical") wlCrit++;
+      else if (status === "warning") wlWarn++;
+      else if (status === "watch") wlWatch++;
+    }
+
+    let rfCrit = 0, rfWarn = 0, rfWatch = 0;
+    for (const st of rfStations) {
+      const t = teleMap.get(st.id);
+      const status = (t?.situationStatus as SituationStatus) || "normal";
+      if (status === "critical") rfCrit++;
+      else if (status === "warning") rfWarn++;
+      else if (status === "watch") rfWatch++;
+    }
+
+    const overallStatus: SituationStatus = evaluateBasinOverallStatus({
+      wlTotal: wlStations.length,
+      wlCrit,
+      wlWarn,
+      wlWatch,
+      rfTotal: rfStations.length,
+      rfCrit,
+      rfWarn,
+      rfWatch,
+    });
 
     const statusSummary: BasinStatusSummary = {
       normalCount,
