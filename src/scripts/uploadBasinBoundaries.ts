@@ -15,7 +15,6 @@ const THAIWATER_BASIN_NAMES: Record<string, string> = {
   chi: "ชี",
   mun: "มูล",
   "khong-north": "โขงเหนือ",
-  "chao-phraya": "เจ้าพระยา",
   "pa-sak": "ป่าสัก",
   salawin: "สาละวิน",
   "khong-ne": "โขงตะวันออกเฉียงเหนือ",

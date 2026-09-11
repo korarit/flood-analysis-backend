@@ -1,7 +1,7 @@
 import { boolean, doublePrecision, jsonb, pgTable, text, timestamp, varchar } from "drizzle-orm/pg-core";
 
 export const basins = pgTable("basins", {
-  id: text("id").primaryKey(), // e.g. 'yom', 'ping', 'wang', 'nan', 'chi', 'mun', 'chao-phraya'
+  id: text("id").primaryKey(), // e.g. 'yom', 'ping', 'wang', 'nan', 'chi', 'mun'
   slug: varchar("slug", { length: 64 }).notNull().unique(),
   code: varchar("code", { length: 16 }).notNull(),
   nameTh: varchar("name_th", { length: 255 }).notNull(),

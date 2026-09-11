@@ -98,19 +98,6 @@ export const initialBasins = [
     isActive: true,
     status: "active",
   },
-  {
-    id: "chao-phraya",
-    slug: "chao-phraya",
-    code: "10",
-    nameTh: "ลุ่มน้ำเจ้าพระยา",
-    nameEn: "Chao Phraya River Basin",
-    descriptionTh: "ลุ่มน้ำสายหลักของภาคกลาง รองรับน้ำจาก ปิง วัง ยม น่าน",
-    descriptionEn: "The main river basin of central Thailand, receiving flow from Ping, Wang, Yom, and Nan.",
-    areaKm2: 20120,
-    boundaryGeojsonPath: null,
-    isActive: true,
-    status: "active",
-  },
 ];
 
 export async function seedDatabase() {

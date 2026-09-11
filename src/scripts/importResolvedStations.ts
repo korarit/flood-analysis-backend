@@ -18,7 +18,10 @@ async function main() {
     process.exit(1);
   }
 
-  const targetBasins = ["yom", "ping", "nan", "wang", "chao-phraya", "chi", "khong-north", "mun", "pa-sak"];
+  const args = process.argv.slice(2);
+  const basinArg = args.find((a) => a.startsWith("--basin="))?.split("=")[1] || (args[0] && !args[0].startsWith("-") ? args[0] : null);
+  const defaultBasins = ["yom", "ping", "nan", "wang", "chi", "khong-north", "mun", "pa-sak"];
+  const targetBasins = basinArg ? [basinArg.toLowerCase().trim()] : defaultBasins;
 
   let totalWaterlevelImported = 0;
   let totalRainfallImported = 0;

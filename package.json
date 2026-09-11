@@ -14,6 +14,7 @@
     "sync:bulletin": "bun src/scripts/syncBulletin.ts",
     "llm:sync": "bun src/scripts/syncBulletin.ts",
     "scraper": "bun src/scripts/syncTelemetry.ts",
+    "clean:chao": "bun src/scripts/cleanChaoPhraya.ts",
     "import:stations": "bun src/scripts/importResolvedStations.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
