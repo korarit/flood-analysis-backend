@@ -56,6 +56,39 @@ export interface StationCurrentDataset {
   updatedAt: string;
 }
 
+export interface StationCurrentItem {
+  timestamp: string;
+  status: SituationStatus;
+  freshness: FreshnessStatus;
+  alertReason?: {
+    th: string;
+    en: string;
+  };
+  isUpstreamAlert?: boolean;
+  stage?: number | null;
+  discharge?: number | null;
+  waterLevelMsl?: number | null;
+  storagePercent?: number | null;
+  trend?: TrendDirection;
+  rainfall1h?: number | null;
+  rainfall3h?: number | null;
+  rainfall6h?: number | null;
+  rainfall24h?: number | null;
+  rainfallToday?: number | null;
+  intensity?: RainIntensity;
+  updatedAt: string;
+}
+
+export interface BasinCurrentDataset {
+  schemaVersion: string;
+  datasetVersion: string;
+  basin: string;
+  type: "water_level" | "rainfall";
+  generatedAt: string;
+  totalStations: number;
+  stations: Record<string, StationCurrentItem>;
+}
+
 export interface StationHistoryDataset {
   schemaVersion: string;
   datasetVersion: string;

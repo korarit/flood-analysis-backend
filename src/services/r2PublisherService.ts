@@ -244,17 +244,12 @@ export class R2PublisherService {
   }
 
   /**
-   * 4.2 & 4.3 Publish `/basin/{slug}/basin.json` & `/basin/{slug}/overview.json`
+   * 4.2 Publish static basin metadata (`/basin/{slug}/basin.json`)
    */
-  async publishBasinOverview(basinSlug: string): Promise<void> {
+  async publishBasinMetadata(basinSlug: string): Promise<{ success: boolean; url: string }> {
     const [b] = await db.select().from(basins).where(eq(basins.slug, basinSlug));
-    if (!b) return;
+    if (!b) throw new Error(`Basin ${basinSlug} not found`);
 
-    const { all: bStations, waterlevel: wlStations, rainfall: rfStations } = await this.getStationsForBasin(b.id);
-    const allTele = await db.select().from(telemetryLatest).where(eq(telemetryLatest.basinId, b.id));
-    const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
-
-    // 1. Publish /basin/{slug}/basin.json
     const basinJson = {
       schemaVersion: this.schemaVersion,
       id: b.id,
@@ -271,6 +266,31 @@ export class R2PublisherService {
     const basinPath = `basin/${b.slug}/basin.json`;
     const bRes = await r2Storage.putJson(basinPath, basinJson, "public, max-age=3600, s-maxage=3600");
     await this.registerDataset(b.id, "basin", basinPath, bRes.etag);
+    return bRes;
+  }
+
+  /**
+   * 4.3 Publish `/basin/{slug}/overview.json` (and optionally `/basin/{slug}/basin.json`)
+   */
+  async publishBasinOverview(
+    basinSlug: string,
+    options?: { skipBasinMeta?: boolean }
+  ): Promise<void> {
+    const [b] = await db.select().from(basins).where(eq(basins.slug, basinSlug));
+    if (!b) return;
+
+    const { all: bStations, waterlevel: wlStations, rainfall: rfStations } = await this.getStationsForBasin(b.id);
+    if (bStations.length === 0) {
+      console.log(`ℹ️ [r2Publisher] Basin ${basinSlug} has 0 stations, skipping overview publish.`);
+      return;
+    }
+    const allTele = await db.select().from(telemetryLatest).where(eq(telemetryLatest.basinId, b.id));
+    const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
+
+    // 1. Publish /basin/{slug}/basin.json (Only if not skipped)
+    if (!options?.skipBasinMeta) {
+      await this.publishBasinMetadata(basinSlug);
+    }
 
     // 2. Publish /basin/{slug}/overview.json
     let normalCount = 0;
@@ -361,6 +381,10 @@ export class R2PublisherService {
     if (!b) return;
 
     const { all: bStations } = await this.getStationsForBasin(b.id);
+    if (bStations.length === 0) {
+      console.log(`ℹ️ [r2Publisher] Basin ${basinSlug} has 0 stations, skipping stations list publish.`);
+      return;
+    }
     const allTele = await db.select().from(telemetryLatest).where(eq(telemetryLatest.basinId, b.id));
     const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
 

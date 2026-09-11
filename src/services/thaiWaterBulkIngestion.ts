@@ -3,10 +3,12 @@ import { env } from "../config/env";
 import { db } from "../db";
 import { basins, rainfallStations, telemetryLatest, waterlevelStations } from "../db/schema";
 import {
+  BasinCurrentDataset,
   FreshnessStatus,
   RainIntensity,
   SituationStatus,
   StationCurrentDataset,
+  StationCurrentItem,
   TrendDirection,
 } from "../types";
 import { formatBangkokDateTime, parseThaiWaterDate } from "../utils/date";
@@ -367,9 +369,12 @@ export class ThaiWaterBulkIngestionService {
     const errors: any[] = [];
 
     const recordsToUpsert: (typeof telemetryLatest.$inferInsert)[] = [];
-    const r2CurrentUpdates: { path: string; payload: StationCurrentDataset }[] = [];
+    const basinWlCurrentMap = new Map<string, Record<string, StationCurrentItem>>();
+    const basinRfCurrentMap = new Map<string, Record<string, StationCurrentItem>>();
 
     for (const b of activeBasins) {
+      basinWlCurrentMap.set(b.slug, {});
+      basinRfCurrentMap.set(b.slug, {});
       const rainList = await db.select().from(rainfallStations).where(eq(rainfallStations.basinId, b.id));
       const waterList = await db.select().from(waterlevelStations).where(eq(waterlevelStations.basinId, b.id));
       totalStations += rainList.length + waterList.length;
@@ -533,31 +538,21 @@ export class ThaiWaterBulkIngestionService {
         });
 
         if (writeStationCurrentJson) {
-          const currentPayload: StationCurrentDataset = {
-            schemaVersion: "1.0",
-            datasetVersion: new Date().toISOString(),
-            stationId: st.id,
-            basin: b.slug,
-            type: "rainfall",
+          const rfItem: StationCurrentItem = {
             timestamp: latestTime.toISOString(),
             status: situationStatus,
             freshness,
             alertReason: alertReasonTh ? { th: alertReasonTh, en: alertReasonEn || "" } : undefined,
             isUpstreamAlert: false,
-            rainfall: {
-              value1h: rain1h,
-              value3h: rain3h,
-              value6h: rain6h,
-              value24h: rain24h,
-              valueToday: rainToday,
-              intensity: this.calculateRainIntensity(rain24h),
-            },
+            rainfall1h: rain1h,
+            rainfall3h: rain3h,
+            rainfall6h: rain6h,
+            rainfall24h: rain24h,
+            rainfallToday: rainToday,
+            intensity: this.calculateRainIntensity(rain24h),
             updatedAt: new Date().toISOString(),
           };
-          r2CurrentUpdates.push({
-            path: `rainfall_station/${b.slug}/${st.id}/current.json`,
-            payload: currentPayload,
-          });
+          basinRfCurrentMap.get(b.slug)![st.id] = rfItem;
         }
 
         const rainObs = {
@@ -787,30 +782,20 @@ export class ThaiWaterBulkIngestionService {
         });
 
         if (writeStationCurrentJson) {
-          const currentPayload: StationCurrentDataset = {
-            schemaVersion: "1.0",
-            datasetVersion: new Date().toISOString(),
-            stationId: st.id,
-            basin: b.slug,
-            type: "water_level",
+          const wlItem: StationCurrentItem = {
             timestamp: latestTime.toISOString(),
             status: situationStatus,
             freshness,
             alertReason: alertReasonTh ? { th: alertReasonTh, en: alertReasonEn || "" } : undefined,
             isUpstreamAlert,
-            waterLevel: {
-              stage,
-              discharge,
-              waterLevelMsl,
-              storagePercent,
-              trend,
-            },
+            stage,
+            discharge,
+            waterLevelMsl,
+            storagePercent,
+            trend,
             updatedAt: new Date().toISOString(),
           };
-          r2CurrentUpdates.push({
-            path: `waterlevel_station/${b.slug}/${st.id}/current.json`,
-            payload: currentPayload,
-          });
+          basinWlCurrentMap.get(b.slug)![st.id] = wlItem;
         }
 
         synced++;
@@ -859,37 +844,69 @@ export class ThaiWaterBulkIngestionService {
     console.log(`✅ [BulkIngestion] PostgreSQL batch upsert completed in ${Date.now() - tDbStart}ms`);
 
     // 5. Update R2 Snapshots
-    // 5.1 Station current.json (Chunked concurrency)
-    if (writeStationCurrentJson && r2CurrentUpdates.length > 0) {
-      const uniqueR2Map = new Map<string, { path: string; payload: StationCurrentDataset }>();
-      for (const u of r2CurrentUpdates) {
-        uniqueR2Map.set(u.path, u);
-      }
-      const deduplicatedR2 = Array.from(uniqueR2Map.values());
-
+    // 5.1 Basin Consolidated current.json (Keyed by stationId - only 2 writes per basin)
+    if (writeStationCurrentJson) {
       const tR2Start = Date.now();
-      console.log(`📦 [BulkIngestion] Overwriting ${deduplicatedR2.length} station current.json on R2...`);
-      const R2_CONCURRENCY = 50;
-      for (let i = 0; i < deduplicatedR2.length; i += R2_CONCURRENCY) {
-        const batch = deduplicatedR2.slice(i, i + R2_CONCURRENCY);
-        await Promise.all(
-          batch.map((item) =>
-            r2Storage
-              .putJson(item.path, item.payload, "public, max-age=60, s-maxage=60")
-              .catch((err) =>
-                console.warn(`⚠️ Warning writing current.json for ${item.path}:`, err.message)
-              )
-          )
-        );
+      console.log(`📦 [BulkIngestion] Publishing consolidated basin current.json on R2...`);
+
+      for (const b of activeBasins) {
+        const wlDict = basinWlCurrentMap.get(b.slug) || {};
+        const rfDict = basinRfCurrentMap.get(b.slug) || {};
+        const wlKeys = Object.keys(wlDict);
+        const rfKeys = Object.keys(rfDict);
+
+        // Waterlevel current.json
+        if (wlKeys.length > 0) {
+          const wlDataset: BasinCurrentDataset = {
+            schemaVersion: "1.0",
+            datasetVersion: new Date().toISOString(),
+            basin: b.slug,
+            type: "water_level",
+            generatedAt: new Date().toISOString(),
+            totalStations: wlKeys.length,
+            stations: wlDict,
+          };
+          await r2Storage
+            .putJson(
+              `waterlevel_station/${b.slug}/current.json`,
+              wlDataset,
+              "public, max-age=60, s-maxage=60"
+            )
+            .catch((err) =>
+              console.warn(`⚠️ Warning writing waterlevel current.json for ${b.slug}:`, err.message)
+            );
+        }
+
+        // Rainfall current.json
+        if (rfKeys.length > 0) {
+          const rfDataset: BasinCurrentDataset = {
+            schemaVersion: "1.0",
+            datasetVersion: new Date().toISOString(),
+            basin: b.slug,
+            type: "rainfall",
+            generatedAt: new Date().toISOString(),
+            totalStations: rfKeys.length,
+            stations: rfDict,
+          };
+          await r2Storage
+            .putJson(
+              `rainfall_station/${b.slug}/current.json`,
+              rfDataset,
+              "public, max-age=60, s-maxage=60"
+            )
+            .catch((err) =>
+              console.warn(`⚠️ Warning writing rainfall current.json for ${b.slug}:`, err.message)
+            );
+        }
       }
-      console.log(`✅ [BulkIngestion] Station current.json files updated in ${Date.now() - tR2Start}ms`);
+      console.log(`✅ [BulkIngestion] Basin current.json published in ${Date.now() - tR2Start}ms`);
     }
 
     // 5.2 Basin Overview & Station Snapshots on R2
     for (const b of activeBasins) {
       try {
         await r2Publisher.publishBasinStationsList(b.slug);
-        await r2Publisher.publishBasinOverview(b.slug);
+        await r2Publisher.publishBasinOverview(b.slug, { skipBasinMeta: true });
       } catch (pubErr: any) {
         console.warn(`⚠️ Warning publishing R2 aggregates for basin ${b.slug}:`, pubErr.message);
       }
