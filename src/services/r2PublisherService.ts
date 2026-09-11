@@ -445,7 +445,7 @@ export class R2PublisherService {
     };
 
     const path = "basins.json";
-    const res = await r2Storage.putJson(path, payload, "public, max-age=600, s-maxage=600");
+    const res = await r2Storage.putJson(path, payload, "public, max-age=60, s-maxage=120");
     await this.registerDataset(null, "basins", path, res.etag);
     return res;
   }
@@ -596,7 +596,7 @@ export class R2PublisherService {
     };
 
     const overviewPath = `basin/${b.slug}/overview.json`;
-    const oRes = await r2Storage.putJson(overviewPath, overviewPayload, "public, max-age=120, s-maxage=120");
+    const oRes = await r2Storage.putJson(overviewPath, overviewPayload, "public, max-age=60, s-maxage=120");
     await this.registerDataset(b.id, "overview", overviewPath, oRes.etag);
   }
 
@@ -669,11 +669,11 @@ export class R2PublisherService {
     const rfStationsList = stationItems.filter((s) => s.type === "rainfall");
 
     const wlListPath = `waterlevel_station/${b.slug}/stations.json`;
-    await r2Storage.putJson(wlListPath, { ...payload, totalStations: wlStationsList.length, stations: wlStationsList }, "public, max-age=180, s-maxage=180");
+    await r2Storage.putJson(wlListPath, { ...payload, totalStations: wlStationsList.length, stations: wlStationsList }, "public, max-age=60, s-maxage=120");
     await this.registerDataset(b.id, "stations_waterlevel", wlListPath);
 
     const rfListPath = `rainfall_station/${b.slug}/stations.json`;
-    await r2Storage.putJson(rfListPath, { ...payload, totalStations: rfStationsList.length, stations: rfStationsList }, "public, max-age=180, s-maxage=180");
+    await r2Storage.putJson(rfListPath, { ...payload, totalStations: rfStationsList.length, stations: rfStationsList }, "public, max-age=60, s-maxage=120");
     await this.registerDataset(b.id, "stations_rainfall", rfListPath);
   }
 
@@ -876,7 +876,7 @@ export class R2PublisherService {
       receivingWaterlevelStations: !isWL ? enrichedReceiving : undefined,
       relations: relationItems,
     };
-    const rRes = await r2Storage.putJson(relPath, relPayload, "public, max-age=180, s-maxage=180");
+    const rRes = await r2Storage.putJson(relPath, relPayload, "public, max-age=120, s-maxage=120");
     await this.registerDataset(st.basinId, "relations", relPath, rRes.etag);
   }
 
@@ -902,7 +902,7 @@ export class R2PublisherService {
       stations: orderedStationIds,
       edges,
     };
-    await r2Storage.putJson(chainPath, chainPayload, "public, max-age=3600, s-maxage=3600");
+    await r2Storage.putJson(chainPath, chainPayload, "public, max-age=300, s-maxage=600");
 
     // 2. events/feed.json
     const alertEvents: any[] = [];
@@ -950,7 +950,7 @@ export class R2PublisherService {
       generatedAt: this.getNowIso(),
       events: alertEvents,
     };
-    await r2Storage.putJson(feedPath, feedPayload, "public, max-age=600, s-maxage=600");
+    await r2Storage.putJson(feedPath, feedPayload, "public, max-age=180, s-maxage=180");
 
     // 3. /basin/{basin}/report/bulletin-latest.json
     try {
@@ -986,7 +986,7 @@ export class R2PublisherService {
     }
 
     if (riversGeoJson) {
-      await r2Storage.putJson(riversPath, riversGeoJson, "public, max-age=604800, s-maxage=604800");
+      await r2Storage.putJson(riversPath, riversGeoJson, "public, max-age=3600, s-maxage=3600");
     }
   }
 
@@ -1046,7 +1046,7 @@ export class R2PublisherService {
     }
 
     const r2Key = `basin/${b.slug}/spatial/boundary.geojson`;
-    const putRes = await r2Storage.putJson(r2Key, boundaryGeoJson, "public, max-age=604800, s-maxage=604800");
+    const putRes = await r2Storage.putJson(r2Key, boundaryGeoJson, "public, max-age=3600, s-maxage=3600");
 
     // Update database basins record
     await db
@@ -1197,7 +1197,7 @@ export class R2PublisherService {
       r2Key,
       gzBuffer,
       "application/gzip",
-      "public, max-age=604800, s-maxage=604800"
+      "public, max-age=3600, s-maxage=3600"
     );
 
     // Update database basins record

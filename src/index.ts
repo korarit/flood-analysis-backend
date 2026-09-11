@@ -52,14 +52,15 @@ app.get("/r2-static/*", (c) => {
       const buffer = readFileSync(localFile);
       return c.body(buffer, 200, {
         "Content-Type": "application/gzip",
-        "Cache-Control": "public, max-age=604800",
+        "Cache-Control": "public, max-age=3600",
       });
     }
     const isGeoJson = filePath.endsWith(".geojson");
+    const isFeed = filePath.endsWith("feed.json");
     const content = readFileSync(localFile, "utf-8");
     return c.text(content, 200, {
       "Content-Type": isGeoJson ? "application/geo+json; charset=utf-8" : "application/json; charset=utf-8",
-      "Cache-Control": "public, max-age=60",
+      "Cache-Control": isGeoJson ? "public, max-age=3600" : (isFeed ? "public, max-age=180" : "public, max-age=60"),
     });
   }
 

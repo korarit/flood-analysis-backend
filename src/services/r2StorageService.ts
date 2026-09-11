@@ -37,7 +37,7 @@ export class R2StorageService {
   async putJson(
     key: string,
     data: any,
-    cacheControl: string = "public, max-age=120, s-maxage=120"
+    cacheControl: string = "public, max-age=60, s-maxage=120"
   ): Promise<{ success: boolean; etag?: string; url: string }> {
     const cleanKey = key.startsWith("/") ? key.slice(1) : key;
     const jsonString = JSON.stringify(data, null, 2);
