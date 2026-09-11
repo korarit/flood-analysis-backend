@@ -21,6 +21,65 @@ import { formatBangkokDate } from "../utils/date";
 import { llmBulletinService } from "./llmBulletinService";
 import { r2Storage } from "./r2StorageService";
 
+const BASIN_METADATA_EXTRAS: Record<
+  string,
+  { bgGradient: string; accentColor: string; center: [number, number]; zoom: number }
+> = {
+  yom: { bgGradient: "from-teal-950 via-slate-900 to-cyan-950", accentColor: "#06B6D4", center: [17.5, 100.0], zoom: 8 },
+  nan: { bgGradient: "from-blue-950 via-slate-900 to-indigo-950", accentColor: "#3B82F6", center: [18.2, 100.8], zoom: 8 },
+  ping: { bgGradient: "from-sky-950 via-slate-900 to-blue-950", accentColor: "#0EA5E9", center: [18.5, 99.0], zoom: 8 },
+  wang: { bgGradient: "from-emerald-950 via-slate-900 to-slate-950", accentColor: "#10B981", center: [17.8, 99.2], zoom: 8 },
+  mun: { bgGradient: "from-amber-950 via-slate-900 to-slate-950", accentColor: "#F59E0B", center: [15.2, 103.5], zoom: 8 },
+  chi: { bgGradient: "from-violet-950 via-slate-900 to-slate-950", accentColor: "#8B5CF6", center: [16.0, 102.8], zoom: 8 },
+  "khong-north": { bgGradient: "from-cyan-950 via-slate-900 to-teal-950", accentColor: "#14B8A6", center: [19.8, 100.0], zoom: 8 },
+};
+
+const BASIN_MAIN_RIVERS: Record<string, Array<{ th: string; en: string }>> = {
+  yom: [
+    { th: "แม่น้ำยม", en: "Yom River" },
+    { th: "ลำน้ำควร", en: "Khuan River" },
+    { th: "แม่น้ำงาว", en: "Ngao River" },
+    { th: "คลองหกบาท", en: "Khlong Hok Bat" },
+  ],
+  nan: [
+    { th: "แม่น้ำน่าน", en: "Nan River" },
+    { th: "แม่น้ำว้า", en: "Wa River" },
+    { th: "แม่น้ำปาด", en: "Pat River" },
+    { th: "แม่น้ำแควน้อย", en: "Khwae Noi River" },
+  ],
+  ping: [
+    { th: "แม่น้ำปิง", en: "Ping River" },
+    { th: "แม่น้ำกวง", en: "Kuang River" },
+    { th: "แม่น้ำแจ่ม", en: "Chaem River" },
+    { th: "แม่น้ำงัด", en: "Ngat River" },
+  ],
+  wang: [
+    { th: "แม่น้ำวัง", en: "Wang River" },
+    { th: "แม่น้ำตุ๋ย", en: "Tui River" },
+    { th: "แม่น้ำจาง", en: "Chang River" },
+    { th: "แม่น้ำสอย", en: "Soi River" },
+  ],
+  mun: [
+    { th: "แม่น้ำมูล", en: "Mun River" },
+    { th: "ลำตะคอง", en: "Lam Takhong" },
+    { th: "ลำพระเพลิง", en: "Lam Phra Phloeng" },
+    { th: "ลำเซบาย", en: "Lam Se Bai" },
+    { th: "ลำโดมใหญ่", en: "Lam Dom Yai" },
+  ],
+  chi: [
+    { th: "แม่น้ำชี", en: "Chi River" },
+    { th: "ลำน้ำพอง", en: "Lam Nam Phong" },
+    { th: "ลำปาว", en: "Lam Pao" },
+    { th: "ลำน้ำเชิญ", en: "Lam Nam Choen" },
+  ],
+  "khong-north": [
+    { th: "แม่น้ำโขง", en: "Mekong River" },
+    { th: "แม่น้ำกก", en: "Kok River" },
+    { th: "แม่น้ำสาย", en: "Sai River" },
+    { th: "แม่น้ำอิง", en: "Ing River" },
+  ],
+};
+
 export class R2PublisherService {
   private schemaVersion = "1.0";
 
@@ -194,38 +253,109 @@ export class R2PublisherService {
    */
   async publishBasinsList(): Promise<{ success: boolean; url: string }> {
     const activeBasins = await db.select().from(basins).where(eq(basins.isActive, true));
-    const { all: allStations } = await this.getStationsForBasin();
+    const { all: allStations, waterlevel: allWl, rainfall: allRf } = await this.getStationsForBasin();
     const allTele = await db.select().from(telemetryLatest);
 
     const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
 
     const basinsData = activeBasins.map((b) => {
       const bStations = allStations.filter((s) => s.basinId === b.id);
-      let overallStatus: SituationStatus = "normal";
+      const bWl = allWl.filter((s) => s.basinId === b.id);
+      const bRf = allRf.filter((s) => s.basinId === b.id);
+
+      let normalCount = 0;
+      let watchCount = 0;
+      let warningCount = 0;
+      let criticalCount = 0;
+      let missingCount = 0;
+      let risingCount = 0;
+      let heavyRainCount = 0;
 
       for (const st of bStations) {
         const t = teleMap.get(st.id);
         const status = (t?.situationStatus as SituationStatus) || "normal";
         if (status === "critical") {
-          overallStatus = "critical";
-          break;
+          criticalCount++;
+        } else if (status === "warning") {
+          warningCount++;
+        } else if (status === "watch") {
+          watchCount++;
+        } else if (status === "missing") {
+          missingCount++;
+        } else {
+          normalCount++;
         }
-        if (status === "warning") {
-          overallStatus = "warning";
-        } else if (status === "watch" && overallStatus === "normal") {
-          overallStatus = "watch";
+
+        if (t?.trend === "rising") risingCount++;
+        if (t?.rainfall24h && t.rainfall24h >= 35) heavyRainCount++;
+      }
+
+      const overallStatus: SituationStatus =
+        criticalCount > 0
+          ? "critical"
+          : warningCount > 0
+          ? "warning"
+          : watchCount > 0
+          ? "watch"
+          : "normal";
+
+      // Distinct provinces covered by stations in this basin
+      const provinceMap = new Map<string, string>();
+      for (const st of bStations) {
+        if (st.provinceNameTh && st.provinceNameTh.trim()) {
+          const th = st.provinceNameTh.trim();
+          const en = st.provinceNameEn?.trim() || th;
+          if (!provinceMap.has(th)) {
+            provinceMap.set(th, en);
+          }
         }
       }
+      const provinces = Array.from(provinceMap.entries())
+        .sort(([a], [b]) => a.localeCompare(b, "th"))
+        .map(([th, en]) => ({ th, en }));
+
+      // Main rivers
+      const presetRivers = BASIN_MAIN_RIVERS[b.slug] || BASIN_MAIN_RIVERS[b.id];
+      const mainRivers = presetRivers || [{ th: `แม่น้ำ${b.nameTh.replace("ลุ่มน้ำ", "")}`, en: `${b.nameEn}` }];
+
+      // Visual preset
+      const visual = BASIN_METADATA_EXTRAS[b.slug] || BASIN_METADATA_EXTRAS[b.id] || {
+        bgGradient: "from-cyan-950 via-slate-900 to-blue-950",
+        accentColor: "#06B6D4",
+        center: [17.0, 100.0] as [number, number],
+        zoom: 8,
+      };
 
       return {
         id: b.id,
         slug: b.slug,
         code: b.code,
         name: { th: b.nameTh, en: b.nameEn },
+        description: {
+          th: b.descriptionTh || `ลุ่มน้ำ${b.nameTh}`,
+          en: b.descriptionEn || `${b.nameEn} Basin`,
+        },
+        mainRivers,
+        provinces,
         totalStations: bStations.length,
+        waterLevelStationsCount: bWl.length,
+        rainfallStationsCount: bRf.length,
         overallStatus,
+        statusSummary: {
+          normalCount,
+          watchCount,
+          warningCount,
+          criticalCount,
+          missingCount,
+          risingCount,
+          heavyRainCount,
+        },
         lastUpdated: this.getNowIso(),
         areaKm2: b.areaKm2 || undefined,
+        bgGradient: visual.bgGradient,
+        accentColor: visual.accentColor,
+        center: visual.center,
+        zoom: visual.zoom,
       };
     });
 

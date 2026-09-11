@@ -19,13 +19,15 @@ basinsRouter.get("/", async (c) => {
       ? await db.select().from(basins).where(eq(basins.isActive, true))
       : await db.select().from(basins);
 
-    const { all: allStations } = await r2Publisher.getStationsForBasin();
+    const { all: allStations, waterlevel: allWl, rainfall: allRf } = await r2Publisher.getStationsForBasin();
     const allTele = await db.select().from(telemetryLatest);
 
     const teleMap = new Map(allTele.map((t) => [t.stationId, t]));
 
     const data: (BasinSummary & { isActive: boolean })[] = allBasins.map((b) => {
       const bStations = allStations.filter((s) => s.basinId === b.id);
+      const bWl = allWl.filter((s) => s.basinId === b.id);
+      const bRf = allRf.filter((s) => s.basinId === b.id);
       let overallStatus: SituationStatus = "normal";
 
       for (const st of bStations) {
@@ -48,6 +50,8 @@ basinsRouter.get("/", async (c) => {
         code: b.code,
         name: { th: b.nameTh, en: b.nameEn },
         totalStations: bStations.length,
+        waterLevelStationsCount: bWl.length,
+        rainfallStationsCount: bRf.length,
         overallStatus,
         isActive: b.isActive,
         lastUpdated: b.updatedAt.toISOString(),

@@ -6,10 +6,20 @@ export interface BasinSummary {
   slug: string;
   code: string;
   name: LocalizedString;
-  totalStations: number;
-  overallStatus: SituationStatus;
-  lastUpdated: string;
+  description?: LocalizedString;
+  mainRivers?: LocalizedString[];
+  provinces?: LocalizedString[];
   areaKm2?: number;
+  totalStations: number;
+  waterLevelStationsCount: number;
+  rainfallStationsCount: number;
+  overallStatus: SituationStatus;
+  statusSummary?: BasinStatusSummary;
+  lastUpdated: string;
+  bgGradient?: string;
+  accentColor?: string;
+  center?: [number, number];
+  zoom?: number;
 }
 
 export interface BasinStatusSummary {
@@ -23,10 +33,6 @@ export interface BasinStatusSummary {
 }
 
 export interface BasinDetail extends BasinSummary {
-  description: LocalizedString;
-  waterLevelStationsCount: number;
-  rainfallStationsCount: number;
-  statusSummary: BasinStatusSummary;
   boundaryGeojsonPath?: string | null;
   flowPathsGeojsonPath?: string | null;
 }
