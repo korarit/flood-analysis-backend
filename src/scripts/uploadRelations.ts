@@ -13,6 +13,8 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { getModelDatasetDir } from "../config/paths";
+import { db } from "../db";
+import { basins } from "../db/schema";
 import { r2Publisher } from "../services/r2PublisherService";
 import { stationImporter } from "../services/stationImporterService";
 
@@ -40,9 +42,11 @@ async function main() {
 
   console.log(`📂 Model dataset dir: ${modelDir}\n`);
 
-  // Discover basin folders
+  // Discover basin folders (only active basins in DB)
+  const dbBasins = await db.select({ slug: basins.slug }).from(basins);
+  const activeSlugs = new Set(dbBasins.map((b) => b.slug));
   const allBasinFolders = readdirSync(modelDir, { withFileTypes: true })
-    .filter((d) => d.isDirectory())
+    .filter((d) => d.isDirectory() && activeSlugs.has(d.name))
     .map((d) => d.name);
 
   const basinFolders = targetBasin

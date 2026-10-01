@@ -98,6 +98,19 @@ export const initialBasins = [
     isActive: true,
     status: "active",
   },
+  {
+    id: "pa-sak",
+    slug: "pa-sak",
+    code: "05",
+    nameTh: "ลุ่มน้ำป่าสัก",
+    nameEn: "Pasak River Basin",
+    descriptionTh: "ลุ่มน้ำป่าสักครอบคลุมพื้นที่จังหวัดเลย เพชรบูรณ์ ลพบุรี สระบุรี และพระนครศรีอยุธยา",
+    descriptionEn: "The Pasak River Basin covers Loei, Phetchabun, Lopburi, Saraburi, and Phra Nakhon Si Ayutthaya provinces.",
+    areaKm2: 15887,
+    boundaryGeojsonPath: null,
+    isActive: true,
+    status: "active",
+  },
 ];
 
 export async function seedDatabase() {
@@ -132,8 +145,9 @@ export async function seedDatabase() {
 
     if (modelDatasetDir) {
       console.log(`📂 Found model dataset directory at ${modelDatasetDir}, importing stations and boundaries...`);
+      const allowedBasinSlugs = new Set(initialBasins.map((b) => b.slug));
       const basinFolders = readdirSync(modelDatasetDir, { withFileTypes: true })
-        .filter((d) => d.isDirectory())
+        .filter((d) => d.isDirectory() && allowedBasinSlugs.has(d.name))
         .map((d) => d.name);
 
       for (const slug of basinFolders) {

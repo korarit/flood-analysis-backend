@@ -26,7 +26,9 @@
     "upload:flowpaths": "bun src/scripts/uploadFlowPaths.ts",
     "sync:flowpaths": "bun src/scripts/uploadFlowPaths.ts",
     "upload:basin": "bun src/scripts/publishBasinMeta.ts",
-    "sync:basin": "bun src/scripts/publishBasinMeta.ts"
+    "sync:basin": "bun src/scripts/publishBasinMeta.ts",
+    "upload:relations": "bun src/scripts/uploadRelations.ts",
+    "sync:relations": "bun src/scripts/uploadRelations.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1116.0",

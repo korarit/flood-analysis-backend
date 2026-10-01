@@ -344,8 +344,10 @@ adminRouter.post("/import-all-datasets", async (c) => {
 
   const results: any[] = [];
   try {
+    const dbBasinList = await db.select({ slug: basins.slug }).from(basins);
+    const activeSlugs = new Set(dbBasinList.map((b) => b.slug));
     const basinFolders = readdirSync(modelDatasetDir, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
+      .filter((d) => d.isDirectory() && activeSlugs.has(d.name))
       .map((d) => d.name);
 
     for (const slug of basinFolders) {

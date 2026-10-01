@@ -32,6 +32,7 @@ const BASIN_METADATA_EXTRAS: Record<
   mun: { bgGradient: "from-amber-950 via-slate-900 to-slate-950", accentColor: "#F59E0B", center: [15.2, 103.5], zoom: 8 },
   chi: { bgGradient: "from-violet-950 via-slate-900 to-slate-950", accentColor: "#8B5CF6", center: [16.0, 102.8], zoom: 8 },
   "khong-north": { bgGradient: "from-cyan-950 via-slate-900 to-teal-950", accentColor: "#14B8A6", center: [19.8, 100.0], zoom: 8 },
+  "pa-sak": { bgGradient: "from-emerald-950 via-slate-900 to-teal-950", accentColor: "#10B981", center: [15.8, 101.1], zoom: 8 },
 };
 
 const BASIN_MAIN_RIVERS: Record<string, Array<{ th: string; en: string }>> = {
@@ -77,6 +78,13 @@ const BASIN_MAIN_RIVERS: Record<string, Array<{ th: string; en: string }>> = {
     { th: "แม่น้ำกก", en: "Kok River" },
     { th: "แม่น้ำสาย", en: "Sai River" },
     { th: "แม่น้ำอิง", en: "Ing River" },
+  ],
+  "pa-sak": [
+    { th: "แม่น้ำป่าสัก", en: "Pa Sak River" },
+    { th: "ลำสนธิ", en: "Lam Sonthi" },
+    { th: "ห้วยป่าแดง", en: "Huai Pa Daeng" },
+    { th: "ลำพญากลาง", en: "Lam Phraya Klang" },
+    { th: "แม่น้ำลพบุรี", en: "Lopburi River" },
   ],
 };
 /**
