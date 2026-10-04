@@ -51,9 +51,63 @@ export interface DwrScrapeOptions {
   filterDate?: string; // YYYY-MM-DD (defaults to DWR's latest / today)
 }
 
+export interface DwrProvinceStation {
+  stationCode: string; // e.g. "STN0730"
+  name: string;        // e.g. "บ้านเขาไว้ข้าว"
+  tambon: string;
+  amphoe: string;
+  province: string;
+  rain15m: number;     // ฝน 15 นาที
+  rain12h: number;     // ฝน 12 ชม
+  rain24h: number;     // ฝน 24 ชม
+  rainDaily: number;   // ฝนรายวัน (07:00)
+  temperature?: number | null;
+  waterLevel?: number | null;
+  waterLevel0700?: number | null;
+  soilMoisture?: number | null;
+  measuredAt: Date;    // วันที่และเวลาตรวจวัดจากหน้าเว็บ
+  ageMinutes: number;  // อายุของข้อมูลเทียบกับเวลาปัจจุบัน (นาที)
+  isStale: boolean;    // true หากเก่าเกินเกณฑ์ (เช่น > 60 นาที)
+}
+
+export const DWR_SUPPORTED_PROVINCES = [
+  "กระบี่", "กาญจนบุรี", "กาฬสินธุ์", "กำแพงเพชร", "ขอนแก่น", "จันทบุรี", "ฉะเชิงเทรา", "ชลบุรี", "ชัยภูมิ",
+  "ชุมพร", "เชียงราย", "เชียงใหม่", "ตรัง", "ตราด", "ตาก", "นครนายก", "นครพนม", "นครราชสีมา", "นครศรีธรรมราช",
+  "นครสวรรค์", "นราธิวาส", "น่าน", "บุรีรัมย์", "ประจวบคีรีขันธ์", "ปราจีนบุรี", "ปัตตานี", "พะเยา", "พังงา",
+  "พัทลุง", "พิษณุโลก", "เพชรบุรี", "เพชรบูรณ์", "แพร่", "ภูเก็ต", "มหาสารคาม", "มุกดาหาร", "แม่ฮ่องสอน",
+  "ยโสธร", "ยะลา", "ร้อยเอ็ด", "ระนอง", "ระยอง", "ราชบุรี", "ลพบุรี", "ลำปาง", "ลำพูน", "เลย", "ศรีสะเกษ",
+  "สกลนคร", "สงขลา", "สตูล", "สระแก้ว", "สระบุรี", "สุโขทัย", "สุพรรณบุรี", "สุราษฎร์ธานี", "สุรินทร์",
+  "หนองคาย", "หนองบัวลำภู", "อุดรธานี", "อุตรดิตถ์", "อุทัยธานี", "อุบลราชธานี"
+] as const;
+
+export function parseDwrProvinceTime(timeStr: string): Date | null {
+  if (!timeStr || timeStr.trim() === "" || timeStr.includes("-")) return null;
+  const clean = timeStr.replace("น.", "").trim();
+  const match = clean.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!match) return null;
+
+  const day = parseInt(match[1], 10);
+  const month = parseInt(match[2], 10);
+  let year = parseInt(match[3], 10);
+  const hour = parseInt(match[4], 10);
+  const minute = parseInt(match[5], 10);
+  const second = match[6] ? parseInt(match[6], 10) : 0;
+
+  // Handle Thai Buddhist Era (BE) -> CE (e.g. 69 -> 2569 -> 2026)
+  if (year < 100) year += 2500;
+  if (year > 2400) year -= 543;
+
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  const iso = `${year}-${pad(month)}-${pad(day)}T${pad(hour)}:${pad(minute)}:${pad(second)}+07:00`;
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? null : d;
+}
+
 const BASE_URL = "http://ews1.dwr.go.th/ews/show-rain";
 const DAILY_RAIN_URL = "http://ews1.dwr.go.th/ews/rain-daily";
 const DAILY_RAIN_URL_FALLBACK = "https://ews1.dwr.go.th/ews/rain-daily";
+const PROVINCE_DATA_URL = "http://ews1.dwr.go.th/ews/province-data";
+const PROVINCE_DATA_URL_FALLBACK = "https://ews1.dwr.go.th/ews/province-data";
 
 const HEADERS = {
   "User-Agent":
@@ -462,7 +516,214 @@ export class DwrScraperService {
       return null;
     }
   }
+
+  private provinceCache = new Map<string, { data: Map<string, DwrProvinceStation>; expiry: number }>();
+  private isFetchingProvince = new Map<string, Promise<Map<string, DwrProvinceStation>>>();
+  private provinceFailures = new Map<string, number>();
+
+  /**
+   * Fetches telemetry stations for a specific province from https://ews1.dwr.go.th/ews/province-data?FilterProvince=...
+   * Includes exact measurement timestamp (เวลาตรวจวัด).
+   * If an observation is older than maxAgeMinutes (default: 60 minutes / 1 hour), it is flagged as `isStale: true`.
+   * Cached for 2 minutes per province.
+   */
+  async fetchProvinceStations(
+    provinceName: string,
+    options: {
+      maxAgeMinutes?: number;
+      forceRefresh?: boolean;
+      timeoutMs?: number;
+    } = {}
+  ): Promise<Map<string, DwrProvinceStation>> {
+    const { maxAgeMinutes = 60, forceRefresh = false, timeoutMs = 12000 } = options;
+    const cleanProvince = provinceName.replace(/^(จ\.|จังหวัด)\s*/, "").trim();
+    if (!cleanProvince) {
+      return new Map();
+    }
+
+    const now = Date.now();
+    const cached = this.provinceCache.get(cleanProvince);
+    if (!forceRefresh && cached && now < cached.expiry) {
+      return cached.data;
+    }
+
+    // Circuit Breaker per province
+    const lastFailed = this.provinceFailures.get(cleanProvince) || 0;
+    if (!forceRefresh && now - lastFailed < this.FAILURE_COOLDOWN_MS) {
+      return cached?.data || new Map();
+    }
+
+    // Deduplicate concurrent requests for same province
+    const inFlight = this.isFetchingProvince.get(cleanProvince);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const fetchPromise = (async () => {
+      try {
+        let html: string | null = null;
+        const urls = [
+          `${PROVINCE_DATA_URL}?FilterProvince=${encodeURIComponent(cleanProvince)}`,
+          `${PROVINCE_DATA_URL_FALLBACK}?FilterProvince=${encodeURIComponent(cleanProvince)}`,
+        ];
+
+        for (const url of urls) {
+          try {
+            const res = await fetch(url, {
+              headers: HEADERS,
+              signal: AbortSignal.timeout(timeoutMs),
+            });
+            if (res.ok) {
+              html = await res.text();
+              break;
+            }
+          } catch {
+            // Failover to HTTPS
+          }
+        }
+
+        if (!html) {
+          this.provinceFailures.set(cleanProvince, Date.now());
+          console.warn(`⚠️ [DwrScraper] Failed to fetch province-data for [${cleanProvince}]`);
+          return cached?.data || new Map<string, DwrProvinceStation>();
+        }
+
+        const match = html.match(/<table[^>]*>([\s\S]*?)<\/table>/i);
+        if (!match) {
+          this.provinceFailures.set(cleanProvince, Date.now());
+          console.warn(`⚠️ [DwrScraper] No table found in province-data for [${cleanProvince}]`);
+          return cached?.data || new Map<string, DwrProvinceStation>();
+        }
+
+        const rows = [...match[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
+        const resultMap = new Map<string, DwrProvinceStation>();
+
+        for (let i = 1; i < rows.length; i++) {
+          const cells = [...rows[i][1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((m) =>
+            m[1].replace(/<[^>]+>/g, "").trim()
+          );
+
+          if (cells.length < 15) continue;
+          const rawCode = cells[1].trim();
+          if (rawCode.startsWith("หมู่บ้าน")) continue;
+          if (!rawCode.toUpperCase().startsWith("STN")) continue;
+
+          const stationCode = rawCode.replace(/\*/g, "").trim().toUpperCase();
+          const rain15m = parseFloat(cells[7]);
+          const rain12h = parseFloat(cells[8]);
+          const rain24h = parseFloat(cells[9]);
+          const rainDaily = parseFloat(cells[10]);
+          const temp = parseFloat(cells[6]);
+          const wl = parseFloat(cells[11]);
+          const wl0700 = parseFloat(cells[12]);
+          const soilMoisture = parseFloat(cells[13]);
+          const timeStr = cells[14];
+
+          const measuredAt = parseDwrProvinceTime(timeStr);
+          const ageMinutes = measuredAt ? (now - measuredAt.getTime()) / (60 * 1000) : 99999;
+          const isStale = !measuredAt || ageMinutes > maxAgeMinutes || ageMinutes < -15;
+
+          const safeRain15m = isNaN(rain15m) || rain15m < 0 || rain15m > 300 ? 0 : rain15m;
+          const safeRain12h = isNaN(rain12h) || rain12h < 0 || rain12h > 1000 ? 0 : rain12h;
+          const safeRain24h = isNaN(rain24h) || rain24h < 0 || rain24h > 1500 ? 0 : rain24h;
+          const safeRainDaily = isNaN(rainDaily) || rainDaily < 0 || rainDaily > 1500 ? 0 : rainDaily;
+          const safeTemp = isNaN(temp) || temp < -10 || temp > 65 ? null : temp;
+          const safeWl = isNaN(wl) ? null : wl;
+          const safeWl0700 = isNaN(wl0700) ? null : wl0700;
+          const safeSoil = isNaN(soilMoisture) || soilMoisture < 0 || soilMoisture > 100 ? null : soilMoisture;
+
+          resultMap.set(stationCode, {
+            stationCode,
+            name: cells[2] || "",
+            tambon: cells[3] || "",
+            amphoe: cells[4] || "",
+            province: cells[5] || cleanProvince,
+            rain15m: safeRain15m,
+            rain12h: safeRain12h,
+            rain24h: safeRain24h,
+            rainDaily: safeRainDaily,
+            temperature: safeTemp,
+            waterLevel: safeWl,
+            waterLevel0700: safeWl0700,
+            soilMoisture: safeSoil,
+            measuredAt: measuredAt || new Date(0),
+            ageMinutes: Math.round(ageMinutes),
+            isStale,
+          });
+        }
+
+        if (resultMap.size > 0) {
+          this.provinceCache.set(cleanProvince, {
+            data: resultMap,
+            expiry: Date.now() + 2 * 60 * 1000, // 2 minutes TTL
+          });
+          this.provinceFailures.delete(cleanProvince);
+        }
+
+        return resultMap;
+      } catch (err: any) {
+        this.provinceFailures.set(cleanProvince, Date.now());
+        console.warn(`⚠️ [DwrScraper] Error fetching province-data for [${cleanProvince}]:`, err?.message || err);
+        return cached?.data || new Map<string, DwrProvinceStation>();
+      } finally {
+        this.isFetchingProvince.delete(cleanProvince);
+      }
+    })();
+
+    this.isFetchingProvince.set(cleanProvince, fetchPromise);
+    return fetchPromise;
+  }
+
+  /**
+   * Fetches multiple provinces in parallel and merges into a single station Map.
+   */
+  async fetchProvincesBatch(
+    provinces: string[],
+    options: { maxAgeMinutes?: number; forceRefresh?: boolean; timeoutMs?: number } = {}
+  ): Promise<Map<string, DwrProvinceStation>> {
+    const uniqueProvinces = [...new Set(provinces.map((p) => p.replace(/^(จ\.|จังหวัด)\s*/, "").trim()))].filter(Boolean);
+    const maps = await Promise.all(
+      uniqueProvinces.map((p) => this.fetchProvinceStations(p, options))
+    );
+
+    const merged = new Map<string, DwrProvinceStation>();
+    for (const m of maps) {
+      for (const [code, station] of m) {
+        merged.set(code, station);
+      }
+    }
+    return merged;
+  }
+
+  /**
+   * Quick lookup of a station from province feed.
+   * If older than maxAgeMinutes (default 60 mins), returns null ("ตีเป็น ดึงไม่ได้").
+   */
+  async getProvinceStation(
+    stationCode: string,
+    provinceHint?: string,
+    maxAgeMinutes: number = 60
+  ): Promise<DwrProvinceStation | null> {
+    try {
+      const cleanCode = stationCode.replace(/\*/g, "").trim().toUpperCase();
+      if (provinceHint) {
+        const map = await this.fetchProvinceStations(provinceHint, { maxAgeMinutes });
+        const st = map.get(cleanCode);
+        if (st && !st.isStale) return st;
+        return null;
+      }
+
+      // Check all cached provinces
+      for (const [, cache] of this.provinceCache) {
+        const st = cache.data.get(cleanCode);
+        if (st && !st.isStale) return st;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
 }
 
-
 export const dwrScraper = new DwrScraperService();
+

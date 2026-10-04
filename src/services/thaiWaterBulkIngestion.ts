@@ -642,31 +642,49 @@ export class ThaiWaterBulkIngestionService {
         }
       }
 
-      // 3.2.1 DWR Smart Fallback Engine via https://ews1.dwr.go.th/ews/rain-daily:
-      // Fetches all DWR stations nationwide in ONE single request, cached for 2 mins across basins
+      // 3.2.1 DWR Smart Fallback Engine via https://ews1.dwr.go.th/ews/province-data?FilterProvince=...:
+      // Fetches stations by province with exact observation timestamp (เวลาตรวจวัด).
+      // Rule: If measurement is older than 1 hour (>60 mins), treat as failed / unavailable (ตีเป็นดึงไม่ได้)
       if (dwrFallbackCandidates.length > 0) {
         const tDwrStart = Date.now();
+
+        // Collect distinct provinces for all DWR fallback candidates
+        const targetProvinces = new Set<string>();
+        for (const candidate of dwrFallbackCandidates) {
+          const prov = candidate.st.provinceNameTh
+            ? candidate.st.provinceNameTh.replace(/^(จ\.|จังหวัด)\s*/, "").trim()
+            : "";
+          if (prov) targetProvinces.add(prov);
+        }
+
         console.log(
-          `🌧️ [${b.slug}] Found ${dwrFallbackCandidates.length} DWR stations delayed/missing in ThaiWater. Fallback fetching from DWR rain-daily...`
+          `🌧️ [${b.slug}] Found ${dwrFallbackCandidates.length} DWR stations delayed/missing in ThaiWater across provinces [${[...targetProvinces].join(", ")}]. Fallback fetching from DWR province-data...`
         );
 
         try {
-          const dwrDailyMap = await dwrScraper.fetchAllDailyRainStations();
+          const dwrStationsMap = await dwrScraper.fetchProvincesBatch([...targetProvinces], { maxAgeMinutes: 60 });
 
           let refreshedCount = 0;
+          let staleCount = 0;
+
           for (const candidate of dwrFallbackCandidates) {
             const st = candidate.st;
             const cleanCode = st.oldcode ? st.oldcode.replace(/\*/g, "").trim().toUpperCase() : "";
-            const dwrData = dwrDailyMap.get(cleanCode);
-            if (!dwrData) {
+            const dwrData = dwrStationsMap.get(cleanCode);
+
+            // Rule: If station is not in DWR or older than 1 hour, treat as failed / unavailable ("ตีเป็น ดึงไม่ได้")
+            if (!dwrData || dwrData.isStale) {
+              if (dwrData?.isStale) {
+                staleCount++;
+              }
               if (candidate.indexInUpsert === -1) {
-                // If station was completely missing in ThaiWater and also missing in DWR
+                // If station was completely missing in ThaiWater and DWR is also unavailable/stale
                 failed++;
               }
               continue;
             }
 
-            const dwrTime = dwrData.fetchedAt || new Date();
+            const dwrTime = dwrData.measuredAt;
             const dwrRain15m = dwrData.rain15m;
 
             // Compute rain1h:
@@ -682,7 +700,7 @@ export class ThaiWaterBulkIngestionService {
             }
 
             const baseRain24h = candidate.existingRain24h ?? 0;
-            const rain24h = dwrData.rainDaily > 0 ? dwrData.rainDaily : Math.max(baseRain24h, dwrData.rain12h);
+            const rain24h = dwrData.rain24h > 0 ? dwrData.rain24h : (dwrData.rainDaily > 0 ? dwrData.rainDaily : Math.max(baseRain24h, dwrData.rain12h));
             const rain3h = candidate.existingRain3h ? Math.max(candidate.existingRain3h, dwrRain1h) : dwrRain1h;
             const rain6h = candidate.existingRain6h ? Math.max(candidate.existingRain6h, dwrRain1h) : dwrRain1h;
             const rainToday = dwrData.rainDaily;
@@ -774,10 +792,10 @@ export class ThaiWaterBulkIngestionService {
           }
 
           console.log(
-            `  ✨ [${b.slug}] Successfully refreshed ${refreshedCount}/${dwrFallbackCandidates.length} DWR stations via rain-daily in ${Date.now() - tDwrStart}ms`
+            `  ✨ [${b.slug}] Successfully refreshed ${refreshedCount}/${dwrFallbackCandidates.length} DWR stations via province-data in ${Date.now() - tDwrStart}ms (${staleCount} rejected as stale >1h)`
           );
         } catch (dwrErr: any) {
-          console.warn(`⚠️ [${b.slug}] DWR fallback encountered error, gracefully proceeding with ThaiWater data:`, dwrErr?.message || dwrErr);
+          console.warn(`⚠️ [${b.slug}] DWR province fallback encountered error, gracefully proceeding with ThaiWater data:`, dwrErr?.message || dwrErr);
           for (const candidate of dwrFallbackCandidates) {
             if (candidate.indexInUpsert === -1) {
               failed++;

@@ -124,6 +124,25 @@ async function runBenchmark() {
   console.log(`  ✅ Success: ${con8Result.successful}/${con8Result.totalStations}`);
   console.log("\n" + "=".repeat(79) + "\n");
 
+  // -------------------------------------------------------------------------
+  // TEST 3: Province-Data Benchmark (Exact observation timestamp & 1h stale check)
+  // -------------------------------------------------------------------------
+  console.log(">>> BENCHMARK 3: Province-Data Feed (Timestamp & 1h Stale Rejection) <<<");
+  const testProvinces = ["เชียงใหม่", "พะเยา", "น่าน"];
+  const tProvStart = performance.now();
+
+  const provMap = await dwrScraper.fetchProvincesBatch(testProvinces, { maxAgeMinutes: 60 });
+  const provDuration = performance.now() - tProvStart;
+  const allProvStations = [...provMap.values()];
+  const freshProvStations = allProvStations.filter((s) => !s.isStale);
+  const staleProvStations = allProvStations.filter((s) => s.isStale);
+
+  console.log(`  ⏱️ Fetched 3 Provinces (${testProvinces.join(", ")}) in ${(provDuration / 1000).toFixed(2)}s`);
+  console.log(`  🏢 Total Stations Found: ${allProvStations.length}`);
+  console.log(`  ✅ Fresh Stations (<= 1 hr): ${freshProvStations.length}`);
+  console.log(`  ❌ Stale Stations (> 1 hr, rejected as failed): ${staleProvStations.length}`);
+  console.log("\n" + "=".repeat(79) + "\n");
+
   // Sample Scraped Data Summary
   console.log("📊 SAMPLE SCRAPED DATA (First 5 Stations):");
   console.table(
@@ -148,6 +167,7 @@ async function runBenchmark() {
       1000
     ).toFixed(1)}s (~${(((con8Result.totalDurationMs / 20) * 1150) / 60000).toFixed(2)} minutes)`
   );
+  console.log(`  - Province-Data Batch Speed:   ~${(provDuration / testProvinces.length).toFixed(0)} ms per province (instant multi-station bulk)`);
   console.log("===============================================================================\n");
 
   process.exit(0);

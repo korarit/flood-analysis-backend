@@ -300,13 +300,13 @@ export class ThaiWaterIngestionService {
     if (items.length === 0) {
       if (isDwr && st.oldcode) {
         try {
-          const dwrDaily = await dwrScraper.getDailyStation(st.oldcode);
-          if (dwrDaily) {
-            rain15m = dwrDaily.rain15m;
-            rain12h = dwrDaily.rain12h;
+          const dwrData = await dwrScraper.getProvinceStation(st.oldcode, st.provinceNameTh || undefined, 60);
+          if (dwrData && !dwrData.isStale) {
+            rain15m = dwrData.rain15m;
+            rain12h = dwrData.rain12h;
             dwrFallbackRecord = {
-              datetime: (dwrDaily.fetchedAt || new Date()).toISOString(),
-              rainfallMm: dwrDaily.rain15m,
+              datetime: dwrData.measuredAt.toISOString(),
+              rainfallMm: dwrData.rain15m,
             };
           } else {
             const dwrRes = await dwrScraper.scrapeStationLatest(st.oldcode, { hourlyOnly: true });
@@ -336,12 +336,12 @@ export class ThaiWaterIngestionService {
       // If ThaiWater data is delayed or missing, fallback to DWR direct scraper
       if ((freshness === "delayed" || freshness === "missing") && isDwr && st.oldcode) {
         try {
-          const dwrDaily = await dwrScraper.getDailyStation(st.oldcode);
-          if (dwrDaily) {
-            latestTime = dwrDaily.fetchedAt || new Date();
+          const dwrData = await dwrScraper.getProvinceStation(st.oldcode, st.provinceNameTh || undefined, 60);
+          if (dwrData && !dwrData.isStale) {
+            latestTime = dwrData.measuredAt;
             freshness = "fresh";
-            rain15m = dwrDaily.rain15m;
-            rain12h = dwrDaily.rain12h;
+            rain15m = dwrData.rain15m;
+            rain12h = dwrData.rain12h;
 
             // Rule: If previous telemetry exists, subtract previous 12h rain from current 12h rain
             const [prev] = await db
@@ -352,7 +352,7 @@ export class ThaiWaterIngestionService {
               .from(telemetryLatest)
               .where(eq(telemetryLatest.stationId, st.id));
             const prev12h = prev?.rainfall12h ?? prev?.rainfall1h ?? 0;
-            const diff = Number((dwrDaily.rain12h - prev12h).toFixed(1));
+            const diff = Number((dwrData.rain12h - prev12h).toFixed(1));
             rain1h = diff >= 0 && diff <= 300 ? diff : rain15m;
             dwrFallbackRecord = {
               datetime: latestTime.toISOString(),
