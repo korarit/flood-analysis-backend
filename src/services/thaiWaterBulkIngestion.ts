@@ -14,7 +14,7 @@ import {
 import { formatBangkokDateTime, parseThaiWaterDate } from "../utils/date";
 import { r2Publisher } from "./r2PublisherService";
 import { r2Storage } from "./r2StorageService";
-import { dwrScraper, DwrScrapeResult } from "./dwrScraperService";
+import { dwrScraper, DwrScrapeResult, extractDwrStationCode } from "./dwrScraperService";
 
 
 
@@ -395,7 +395,7 @@ export class ThaiWaterBulkIngestionService {
       const waterList = await db.select().from(waterlevelStations).where(eq(waterlevelStations.basinId, b.id));
       totalStations += rainList.length + waterList.length;
 
-      // Pre-load previous telemetry in this basin for DWR 12h/15m delta calculation
+      // Pre-load previous telemetry in this basin for DWR 12h/15m delta calculation & WL trend
       const existingTelemetry = await db
         .select({
           stationId: telemetryLatest.stationId,
@@ -403,6 +403,8 @@ export class ThaiWaterBulkIngestionService {
           rainfall1h: telemetryLatest.rainfall1h,
           rainfall12h: telemetryLatest.rainfall12h,
           rainfall24h: telemetryLatest.rainfall24h,
+          stage: telemetryLatest.stage,
+          waterLevelMsl: telemetryLatest.waterLevelMsl,
         })
         .from(telemetryLatest)
         .where(eq(telemetryLatest.basinId, b.id));
@@ -831,14 +833,36 @@ export class ThaiWaterBulkIngestionService {
       }
 
       // 3.2 Process Waterlevel Stations
+      const dwrWlFallbackCandidates: Array<{
+        st: typeof waterlevelStations.$inferSelect;
+        reason: "missing_obs" | "delayed" | "missing";
+        indexInUpsert: number;
+        existingTime?: Date;
+        existingMsl?: number | null;
+        existingStage?: number | null;
+      }> = [];
+
       for (const st of waterList) {
         const obs =
           wlById.get(st.id) ||
           (st.oldcode && wlByCode.get(st.oldcode.toLowerCase())) ||
           null;
 
+        const isDwr = Boolean(
+          st.agencyShortnameEn?.toUpperCase() === "DWR" ||
+          (st.oldcode && (st.oldcode.toUpperCase().includes("STN") || st.oldcode.trim().toUpperCase().startsWith("G")))
+        );
+
         if (!obs) {
-          failed++;
+          if (isDwr) {
+            dwrWlFallbackCandidates.push({
+              st,
+              reason: "missing_obs",
+              indexInUpsert: -1,
+            });
+          } else {
+            failed++;
+          }
           continue;
         }
 
@@ -1029,7 +1053,261 @@ export class ThaiWaterBulkIngestionService {
           basinWlCurrentMap.get(b.slug)![st.id] = wlItem;
         }
 
+        const upsertIdx = recordsToUpsert.length - 1;
         synced++;
+
+        if (isDwr && (freshness === "delayed" || freshness === "missing")) {
+          dwrWlFallbackCandidates.push({
+            st,
+            reason: freshness,
+            indexInUpsert: upsertIdx,
+            existingTime: latestTime,
+            existingMsl: waterLevelMsl,
+            existingStage: stage,
+          });
+        }
+      }
+
+      // 3.2.2 DWR Waterlevel Smart Fallback Engine via https://ews1.dwr.go.th/ews/rain-daily
+      // Pulls live 15-minute water level telemetry from DWR rain-daily.
+      // DWR water station codes in ThaiWater have G-prefix (e.g. "G09006-STN2203") which splits by '-' to "STN2203".
+      // Automatically filters out inactive/dead stations (> 5 days without update).
+      if (dwrWlFallbackCandidates.length > 0) {
+        console.log(
+          `🌊 [${b.slug}] Found ${dwrWlFallbackCandidates.length} DWR waterlevel stations delayed/missing in ThaiWater. Fallback fetching from DWR rain-daily...`
+        );
+
+        try {
+          const [dwrDailyMap, inactiveStationsSet] = await Promise.all([
+            dwrScraper.fetchAllDailyRainStations(),
+            dwrScraper.loadInactiveStations(),
+          ]);
+
+          let refreshedCount = 0;
+          let inactiveSkippedCount = 0;
+
+          for (const candidate of dwrWlFallbackCandidates) {
+            const st = candidate.st;
+            const cleanDwrCode = extractDwrStationCode(st.oldcode);
+            if (!cleanDwrCode) {
+              if (candidate.indexInUpsert === -1) failed++;
+              continue;
+            }
+
+            // Filter inactive stations (> 5 days without update)
+            if (inactiveStationsSet.has(cleanDwrCode)) {
+              inactiveSkippedCount++;
+              if (candidate.indexInUpsert === -1) failed++;
+              continue;
+            }
+
+            const dwrData = dwrDailyMap.get(cleanDwrCode);
+            if (!dwrData || dwrData.waterLevel === null || dwrData.waterLevel === undefined) {
+              if (candidate.indexInUpsert === -1) failed++;
+              continue;
+            }
+
+            const dwrTime = dwrData.fetchedAt || new Date();
+            const dwrStage = dwrData.waterLevel;
+            const groundLevel = st.groundLevel;
+            const bankLevel = st.minBank;
+            const waterLevelMsl =
+              groundLevel !== null && groundLevel !== undefined
+                ? Number((groundLevel + dwrStage).toFixed(2))
+                : dwrStage;
+            const stage = dwrStage;
+
+            let storagePercent: number | null = null;
+            if (bankLevel && waterLevelMsl !== null) {
+              if (groundLevel !== null && groundLevel !== undefined && bankLevel > groundLevel) {
+                storagePercent = Math.min(150, Math.max(0, Math.round(((waterLevelMsl - groundLevel) / (bankLevel - groundLevel)) * 100)));
+              } else {
+                storagePercent = Math.min(150, Math.max(0, Math.round((waterLevelMsl / bankLevel) * 100)));
+              }
+            }
+
+            const prev = prevTelemetryMap.get(st.id);
+            const prevWl = prev?.waterLevelMsl ?? prev?.stage ?? null;
+            const trend = this.calculateTrend(waterLevelMsl, prevWl);
+            const dwrFreshness: FreshnessStatus = "fresh";
+
+            let situationStatus = this.evaluateSituationStatus({
+              isWaterlevel: true,
+              storagePercent,
+            });
+
+            // Upstream Hydrological Correlation (influencing rainfall)
+            let isUpstreamAlert = false;
+            let upstreamAlertTh: string | null = null;
+            let upstreamAlertEn: string | null = null;
+
+            const metaRelations = (st.rawMetadata as Record<string, any>)?.relations;
+            const influencingRainList: any[] = Array.isArray(metaRelations?.influencingRainfallStations)
+              ? metaRelations.influencingRainfallStations
+              : [];
+
+            const triggeredRainInfluencers: Array<{
+              stationId: string;
+              nameTh: string;
+              nameEn: string;
+              rain24h: number;
+              rain3h: number;
+              warningTh24: number;
+              drySoilTh24: number;
+              distanceKm: number | null;
+              travelTimeHours: number | null;
+              severity: number;
+            }> = [];
+
+            for (const inf of influencingRainList) {
+              const rfId = String(inf.stationId || "").trim();
+              if (!rfId) continue;
+
+              const parsedRain = basinRainMap.get(rfId);
+              const rawObs = !parsedRain ? (rainById.get(rfId) || rainByCode.get(rfId.toLowerCase())) : null;
+
+              const rain24h = parsedRain
+                ? parsedRain.rain24h
+                : typeof rawObs?.measureValue === "number"
+                ? rawObs.measureValue
+                : rawObs?.rainfall24h ?? null;
+              const rain3h = parsedRain ? parsedRain.rain3h : 0;
+
+              if (rain24h === null || rain24h < 35.0) continue;
+
+              const warningTh24 = Number(inf.rainfallThresholds?.["24h"]?.warningRainMm) || 80.0;
+              const drySoilTh24 = Number(inf.rainfallThresholds?.["24h"]?.drySoilWarningRainMm) || 120.0;
+              const warningTh3 = Number(inf.rainfallThresholds?.["3h"]?.warningRainMm) || 35.0;
+
+              const isTriggered =
+                (rain24h >= warningTh24 && rain24h >= 50.0) ||
+                (rain3h >= warningTh3 && rain3h >= 30.0) ||
+                rain24h >= 80.0;
+
+              if (isTriggered) {
+                triggeredRainInfluencers.push({
+                  stationId: rfId,
+                  nameTh: parsedRain?.nameTh || inf.stationName || rfId,
+                  nameEn: parsedRain?.nameEn || parsedRain?.nameTh || inf.stationName || rfId,
+                  rain24h,
+                  rain3h,
+                  warningTh24,
+                  drySoilTh24,
+                  distanceKm: inf.distanceKm != null ? Number(inf.distanceKm) : null,
+                  travelTimeHours: inf.travelTimeHours != null ? Number(inf.travelTimeHours) : null,
+                  severity: rain24h / warningTh24,
+                });
+              }
+            }
+
+            if (triggeredRainInfluencers.length > 0) {
+              const topRain = triggeredRainInfluencers.sort((a, b) => b.severity - a.severity)[0];
+              isUpstreamAlert = true;
+
+              const distTh = topRain.distanceKm != null ? ` ห่าง ${topRain.distanceKm.toFixed(1)} กม.` : "";
+              const distEn = topRain.distanceKm != null ? ` (${topRain.distanceKm.toFixed(1)} km away)` : "";
+              const travelTh = topRain.travelTimeHours != null ? ` คาดมวลน้ำเดินทางถึงใน ~${topRain.travelTimeHours.toFixed(1)} ชม.` : "";
+              const travelEn = topRain.travelTimeHours != null ? ` Runoff expected in ~${topRain.travelTimeHours.toFixed(1)} hrs.` : "";
+
+              upstreamAlertTh = `ขณะนี้มีฝนตกหนักที่ต้นน้ำ (สถานี ${topRain.nameTh} ฝน 24 ชม. ${topRain.rain24h.toFixed(1)} มม.${distTh}) โปรดเฝ้าระวังมวลน้ำหลาก${travelTh}`;
+              upstreamAlertEn = `Heavy upstream rainfall at ${topRain.nameEn} (24h: ${topRain.rain24h.toFixed(1)} mm${distEn}). Watch for downstream runoff.${travelEn}`;
+
+              if (situationStatus === "normal") {
+                situationStatus = (topRain.rain24h >= topRain.drySoilTh24 || topRain.rain24h >= 120.0) ? "warning" : "watch";
+              }
+            }
+
+            // Upstream Waterlevel Correlation
+            if (!isUpstreamAlert) {
+              const upstreamStations = upstreamWaterMap.get(st.id) || [];
+              for (const u of upstreamStations) {
+                const uObs = wlById.get(u.id);
+                if (uObs && (uObs.storagePercent != null && uObs.storagePercent >= 90)) {
+                  isUpstreamAlert = true;
+                  const distTh = u.distanceKm != null ? ` ห่าง ${u.distanceKm.toFixed(1)} กม.` : "";
+                  const distEn = u.distanceKm != null ? ` (${u.distanceKm.toFixed(1)} km away)` : "";
+                  const travelTh = u.travelTimeHours != null ? ` คาดมวลน้ำเดินทางถึงใน ~${u.travelTimeHours.toFixed(1)} ชม.` : "";
+                  const travelEn = u.travelTimeHours != null ? ` Runoff expected in ~${u.travelTimeHours.toFixed(1)} hrs.` : "";
+
+                  upstreamAlertTh = `เฝ้าระวังมวลน้ำหลากจากสถานีต้นน้ำ (สถานี ${u.nameTh}${distTh}) ระดับน้ำสูง ${uObs.storagePercent}% ของตลิ่ง${travelTh}`;
+                  upstreamAlertEn = `Watch for incoming runoff from upstream station ${u.nameEn}${distEn} (Water level at ${uObs.storagePercent}% of bank)${travelEn}`;
+
+                  if (situationStatus === "normal") {
+                    situationStatus = "watch";
+                  }
+                  break;
+                }
+              }
+            }
+
+            let alertReasonTh = upstreamAlertTh;
+            let alertReasonEn = upstreamAlertEn;
+
+            if (!alertReasonTh) {
+              if (situationStatus === "critical") {
+                alertReasonTh = `ระดับน้ำล้นตลิ่ง (${stage.toFixed(2)} ม. / ${storagePercent ?? 100}% ของความจุตลิ่ง) วิกฤตน้ำท่วม (DWR สด 15น)`;
+                alertReasonEn = `River level exceeds bank capacity (${stage.toFixed(2)} m / ${storagePercent ?? 100}%). Critical overflow.`;
+              } else if (situationStatus === "warning") {
+                alertReasonTh = `ระดับน้ำใกล้ล้นตลิ่ง (${stage.toFixed(2)} ม. / ${storagePercent ?? 85}% ของความจุตลิ่ง) เตือนภัย (DWR สด 15น)`;
+                alertReasonEn = `River level near bank capacity (${stage.toFixed(2)} m / ${storagePercent ?? 85}%). Warning stage.`;
+              } else if (situationStatus === "watch") {
+                alertReasonTh = `ระดับน้ำขึ้นสูง (${stage.toFixed(2)} ม. / ${storagePercent ?? 70}% ของความจุตลิ่ง) เฝ้าระวัง (DWR สด 15น)`;
+                alertReasonEn = `Elevated river stage (${stage.toFixed(2)} m / ${storagePercent ?? 70}%). Watch criteria.`;
+              }
+            }
+
+            const updatedTelemetry: typeof telemetryLatest.$inferInsert = {
+              stationId: st.id,
+              basinId: st.basinId,
+              timestamp: dwrTime,
+              stage,
+              discharge: null,
+              waterLevelMsl,
+              storagePercent,
+              trend,
+              situationStatus,
+              freshnessStatus: dwrFreshness,
+              alertReasonTh,
+              alertReasonEn,
+              isUpstreamAlert: isUpstreamAlert ? "true" : "false",
+              updatedAt: new Date(),
+            };
+
+            if (candidate.indexInUpsert >= 0) {
+              recordsToUpsert[candidate.indexInUpsert] = updatedTelemetry;
+            } else {
+              recordsToUpsert.push(updatedTelemetry);
+              synced++;
+            }
+
+            if (writeStationCurrentJson) {
+              const wlItem: StationCurrentItem = {
+                timestamp: dwrTime.toISOString(),
+                status: situationStatus,
+                freshness: dwrFreshness,
+                alertReason: alertReasonTh ? { th: alertReasonTh, en: alertReasonEn || "" } : undefined,
+                isUpstreamAlert,
+                stage,
+                discharge: null,
+                waterLevelMsl,
+                storagePercent,
+                trend,
+                updatedAt: new Date().toISOString(),
+              };
+              basinWlCurrentMap.get(b.slug)![st.id] = wlItem;
+            }
+
+            refreshedCount++;
+          }
+
+          if (refreshedCount > 0 || inactiveSkippedCount > 0) {
+            console.log(
+              `🌊 [${b.slug}] DWR WL Fallback: successfully refreshed ${refreshedCount} stations, filtered out ${inactiveSkippedCount} inactive stations`
+            );
+          }
+        } catch (dwrErr: any) {
+          console.warn(`⚠️ [BulkIngestion] DWR WL fallback error for basin ${b.slug}:`, dwrErr?.message || dwrErr);
+        }
       }
     }
 

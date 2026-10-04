@@ -6,7 +6,7 @@ import { FreshnessStatus, RainIntensity, SituationStatus, StationCurrentDataset,
 import { formatBangkokDate, formatBangkokDateTime, parseThaiWaterDate } from "../utils/date";
 import { r2Publisher } from "./r2PublisherService";
 import { r2Storage } from "./r2StorageService";
-import { dwrScraper } from "./dwrScraperService";
+import { dwrScraper, extractDwrStationCode } from "./dwrScraperService";
 
 
 export interface ThaiWaterHourlyRainItem {
@@ -287,9 +287,10 @@ export class ThaiWaterIngestionService {
   }> {
     const rainRes = await this.fetchRainfallGraph(st.id);
     const isDwr = Boolean(
-      st.oldcode &&
-      (st.oldcode.trim().toUpperCase().startsWith("STN") || st.agencyShortnameEn?.toUpperCase() === "DWR")
+      st.agencyShortnameEn?.toUpperCase() === "DWR" ||
+      (st.oldcode && (st.oldcode.trim().toUpperCase().startsWith("STN") || st.oldcode.includes("STN")))
     );
+    const dwrCode = extractDwrStationCode(st.oldcode);
 
     let dwrFallbackRecord: { datetime: string; rainfallMm: number } | null = null;
     let rain15m: number | null = null;
@@ -298,12 +299,11 @@ export class ThaiWaterIngestionService {
 
     // If ThaiWater has no data and station is DWR, fallback directly to DWR
     if (items.length === 0) {
-      if (isDwr && st.oldcode) {
+      if (isDwr && dwrCode) {
         try {
           const inactiveSet = await dwrScraper.loadInactiveStations();
-          const cleanCode = st.oldcode.replace(/\*/g, "").trim().toUpperCase();
-          if (!inactiveSet.has(cleanCode)) {
-            const dwrDaily = await dwrScraper.getDailyStation(st.oldcode);
+          if (!inactiveSet.has(dwrCode)) {
+            const dwrDaily = await dwrScraper.getDailyStation(dwrCode);
             if (dwrDaily) {
               rain15m = dwrDaily.rain15m;
               rain12h = dwrDaily.rain12h;
@@ -312,7 +312,7 @@ export class ThaiWaterIngestionService {
                 rainfallMm: dwrDaily.rain15m,
               };
             } else {
-              const dwrRes = await dwrScraper.scrapeStationLatest(st.oldcode, { hourlyOnly: true });
+              const dwrRes = await dwrScraper.scrapeStationLatest(dwrCode, { hourlyOnly: true });
               if (dwrRes.success && dwrRes.latestRecord) {
                 dwrFallbackRecord = dwrRes.latestRecord;
               }
@@ -341,9 +341,8 @@ export class ThaiWaterIngestionService {
       if ((freshness === "delayed" || freshness === "missing") && isDwr && st.oldcode) {
         try {
           const inactiveSet = await dwrScraper.loadInactiveStations();
-          const cleanCode = st.oldcode.replace(/\*/g, "").trim().toUpperCase();
-          if (!inactiveSet.has(cleanCode)) {
-            const dwrDaily = await dwrScraper.getDailyStation(st.oldcode);
+          if (dwrCode && !inactiveSet.has(dwrCode)) {
+            const dwrDaily = await dwrScraper.getDailyStation(dwrCode);
             if (dwrDaily) {
               latestTime = dwrDaily.fetchedAt || new Date();
               freshness = "fresh";
@@ -537,22 +536,85 @@ export class ThaiWaterIngestionService {
     >
   ): Promise<boolean> {
     const wlRes = await this.fetchWaterLevelGraph(st.id);
-    if (!wlRes || !wlRes.data || wlRes.data.length === 0) {
-      return false;
+    const isDwr = Boolean(
+      st.agencyShortnameEn?.toUpperCase() === "DWR" ||
+      (st.oldcode && (st.oldcode.toUpperCase().includes("STN") || st.oldcode.trim().toUpperCase().startsWith("G")))
+    );
+    const dwrCode = extractDwrStationCode(st.oldcode);
+
+    let dwrFallbackRecord: { datetime: string; waterLevel: number } | null = null;
+    const mainData = wlRes?.data?.[0];
+    let validPoints = (mainData?.data || []).filter((d) => d.value !== null);
+
+    // If ThaiWater has no data and station is DWR, fallback directly to DWR rain-daily
+    if (validPoints.length === 0) {
+      if (isDwr && dwrCode) {
+        try {
+          const inactiveSet = await dwrScraper.loadInactiveStations();
+          if (!inactiveSet.has(dwrCode)) {
+            const dwrDaily = await dwrScraper.getDailyStation(dwrCode);
+            if (dwrDaily && dwrDaily.waterLevel !== null && dwrDaily.waterLevel !== undefined) {
+              dwrFallbackRecord = {
+                datetime: (dwrDaily.fetchedAt || new Date()).toISOString(),
+                waterLevel: dwrDaily.waterLevel,
+              };
+            }
+          }
+        } catch (dwrErr) {
+          console.warn(`⚠️ [ThaiWaterIngestion] Direct DWR waterlevel scrape failed for ${st.oldcode}:`, dwrErr);
+        }
+      }
+      if (!dwrFallbackRecord) {
+        return false;
+      }
     }
 
-    const mainData = wlRes.data[0];
-    const validPoints = (mainData.data || []).filter((d) => d.value !== null);
-    if (validPoints.length === 0) return false;
+    let latestTime: Date;
+    let stage: number | null;
+    let discharge: number | null = null;
+    let freshness: FreshnessStatus;
 
-    const latestPoint = validPoints[validPoints.length - 1];
-    const latestTime = parseThaiWaterDate(latestPoint.datetime);
-    const stage = latestPoint.value;
-    const discharge = latestPoint.discharge || null;
+    if (validPoints.length > 0) {
+      const latestPoint = validPoints[validPoints.length - 1];
+      latestTime = parseThaiWaterDate(latestPoint.datetime);
+      stage = latestPoint.value;
+      discharge = latestPoint.discharge || null;
+      freshness = this.calculateFreshness(latestTime);
 
-    const groundLevel = mainData.groundLevel ?? st.groundLevel;
-    const bankLevel = mainData.minBank || st.minBank;
-    const criticalLevel = mainData.criticalLevel || bankLevel;
+      // If ThaiWater data is delayed or missing, fallback to DWR direct scraper
+      if ((freshness === "delayed" || freshness === "missing") && isDwr && dwrCode) {
+        try {
+          const inactiveSet = await dwrScraper.loadInactiveStations();
+          if (!inactiveSet.has(dwrCode)) {
+            const dwrDaily = await dwrScraper.getDailyStation(dwrCode);
+            if (dwrDaily && dwrDaily.waterLevel !== null && dwrDaily.waterLevel !== undefined) {
+              stage = dwrDaily.waterLevel;
+              latestTime = dwrDaily.fetchedAt || new Date();
+              freshness = "fresh";
+              dwrFallbackRecord = {
+                datetime: latestTime.toISOString(),
+                waterLevel: stage,
+              };
+            }
+          }
+        } catch (dwrErr) {
+          console.warn(`⚠️ [ThaiWaterIngestion] DWR waterlevel fallback failed for ${st.oldcode}:`, dwrErr);
+        }
+      }
+    } else {
+      latestTime = new Date(dwrFallbackRecord!.datetime);
+      stage = dwrFallbackRecord!.waterLevel;
+      discharge = null;
+      freshness = "fresh";
+    }
+
+    const groundLevel = mainData?.groundLevel ?? st.groundLevel;
+    const bankLevel = mainData?.minBank ?? st.minBank;
+    const criticalLevel = mainData?.criticalLevel || bankLevel;
+    const waterLevelMsl =
+      groundLevel !== null && groundLevel !== undefined && stage !== null
+        ? Number((groundLevel + stage).toFixed(2))
+        : stage;
 
     let warningLevel: number | null = null;
     let watchLevel: number | null = null;
@@ -677,7 +739,6 @@ export class ThaiWaterIngestionService {
 
     const recentValues = validPoints.slice(-5).map((p) => p.value);
     const trend = this.calculateTrend(recentValues);
-    const freshness = this.calculateFreshness(latestTime);
 
     // 1. Overwrite / Replace current.json directly on R2
     const currentPayload: StationCurrentDataset = {
@@ -694,7 +755,7 @@ export class ThaiWaterIngestionService {
       waterLevel: {
         stage,
         discharge,
-        waterLevelMsl: stage,
+        waterLevelMsl,
         storagePercent,
         trend,
       },
@@ -704,11 +765,14 @@ export class ThaiWaterIngestionService {
     await r2Storage.putJson(currentPath, currentPayload, "public, max-age=60, s-maxage=60");
 
     // 2. Append to 7-Day Chunk Timeseries on R2
-    const observations = validPoints.map((p) => ({
-      timestamp: parseThaiWaterDate(p.datetime).toISOString(),
-      stage: p.value,
-      discharge: p.discharge || null,
-    }));
+    const observations =
+      validPoints.length > 0
+        ? validPoints.map((p) => ({
+            timestamp: parseThaiWaterDate(p.datetime).toISOString(),
+            stage: p.value,
+            discharge: p.discharge || null,
+          }))
+        : [{ timestamp: latestTime.toISOString(), stage, discharge: null }];
     await this.append7DayChunkHistory(basinSlug, st.id, "water_level", observations);
 
     // 3. Update telemetry_latest in DB (Secondary Cache for Fast Queries)
@@ -720,7 +784,7 @@ export class ThaiWaterIngestionService {
         timestamp: latestTime,
         stage,
         discharge,
-        waterLevelMsl: stage,
+        waterLevelMsl,
         storagePercent,
         trend,
         situationStatus,
@@ -736,7 +800,7 @@ export class ThaiWaterIngestionService {
           timestamp: latestTime,
           stage,
           discharge,
-          waterLevelMsl: stage,
+          waterLevelMsl,
           storagePercent,
           trend,
           situationStatus,

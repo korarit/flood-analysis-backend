@@ -105,6 +105,22 @@ export function parseDwrProvinceTime(timeStr: string): Date | null {
   return isNaN(d.getTime()) ? null : d;
 }
 
+/**
+ * Extracts clean DWR station code (e.g. STN0632).
+ * For DWR water level stations, codes typically have a G-prefix like "G09006-STN2203".
+ * Splitting by '-' extracts the matched DWR station code "STN2203".
+ */
+export function extractDwrStationCode(code: string | null | undefined): string | null {
+  if (!code) return null;
+  const clean = code.replace(/\*/g, "").trim().toUpperCase();
+  if (clean.includes("-")) {
+    const parts = clean.split("-");
+    const stnPart = parts.find((p) => p.startsWith("STN"));
+    return stnPart || parts[parts.length - 1] || clean;
+  }
+  return clean;
+}
+
 const BASE_URL = "http://ews1.dwr.go.th/ews/show-rain";
 const DAILY_RAIN_URL = "http://ews1.dwr.go.th/ews/rain-daily";
 const DAILY_RAIN_URL_FALLBACK = "https://ews1.dwr.go.th/ews/rain-daily";
@@ -387,7 +403,7 @@ export class DwrScraperService {
     forceRefresh?: boolean;
     timeoutMs?: number;
   } = {}): Promise<Map<string, DwrDailyRainStation>> {
-    const { forceRefresh = false, timeoutMs = 10000 } = options;
+    const { forceRefresh = false, timeoutMs = 25000 } = options;
     const now = Date.now();
 
     // 1. Check active cache
@@ -464,7 +480,7 @@ export class DwrScraperService {
             const safeRain12h = isNaN(rain12h) || rain12h < 0 || rain12h > 1000 ? 0 : rain12h;
             const safeRainDaily = isNaN(rainDaily) || rainDaily < 0 || rainDaily > 1500 ? 0 : rainDaily;
             const safeTemp = isNaN(temp) || temp < -10 || temp > 65 ? null : temp;
-            const safeWl = isNaN(wl) ? null : wl;
+            const safeWl = isNaN(wl) || wl < 0 || wl > 50 ? null : wl;
             const safeHum = isNaN(hum) || hum < 0 || hum > 100 ? null : hum;
 
             resultMap.set(rawCode, {
@@ -508,15 +524,26 @@ export class DwrScraperService {
 
   /**
    * Quick lookup of a single station from the rain-daily feed.
+   * Supports both "STN2203" and prefixed "G09006-STN2203".
    */
   async getDailyStation(stationCode: string): Promise<DwrDailyRainStation | null> {
     try {
       const map = await this.fetchAllDailyRainStations();
-      const clean = stationCode.replace(/\*/g, "").trim().toUpperCase();
+      const clean = extractDwrStationCode(stationCode) || stationCode.replace(/\*/g, "").trim().toUpperCase();
       return map.get(clean) || null;
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Quick lookup of water level data for a single station from the rain-daily feed.
+   * Handles G-prefixed codes like "G09006-STN2203" by extracting "STN2203".
+   */
+  async getDailyWaterLevelStation(stationCode: string): Promise<DwrDailyRainStation | null> {
+    const code = extractDwrStationCode(stationCode);
+    if (!code) return null;
+    return this.getDailyStation(code);
   }
 
   private inactiveStationsCache: Set<string> | null = null;
