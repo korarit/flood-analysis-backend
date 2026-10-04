@@ -299,19 +299,23 @@ export class ThaiWaterIngestionService {
     // If ThaiWater has no data and station is DWR, fallback directly to DWR
     if (items.length === 0) {
       if (isDwr && st.oldcode) {
-        const dwrDaily = await dwrScraper.getDailyStation(st.oldcode);
-        if (dwrDaily) {
-          rain15m = dwrDaily.rain15m;
-          rain12h = dwrDaily.rain12h;
-          dwrFallbackRecord = {
-            datetime: (dwrDaily.fetchedAt || new Date()).toISOString(),
-            rainfallMm: dwrDaily.rain15m,
-          };
-        } else {
-          const dwrRes = await dwrScraper.scrapeStationLatest(st.oldcode, { hourlyOnly: true });
-          if (dwrRes.success && dwrRes.latestRecord) {
-            dwrFallbackRecord = dwrRes.latestRecord;
+        try {
+          const dwrDaily = await dwrScraper.getDailyStation(st.oldcode);
+          if (dwrDaily) {
+            rain15m = dwrDaily.rain15m;
+            rain12h = dwrDaily.rain12h;
+            dwrFallbackRecord = {
+              datetime: (dwrDaily.fetchedAt || new Date()).toISOString(),
+              rainfallMm: dwrDaily.rain15m,
+            };
+          } else {
+            const dwrRes = await dwrScraper.scrapeStationLatest(st.oldcode, { hourlyOnly: true });
+            if (dwrRes.success && dwrRes.latestRecord) {
+              dwrFallbackRecord = dwrRes.latestRecord;
+            }
           }
+        } catch (dwrErr) {
+          console.warn(`⚠️ [ThaiWaterIngestion] Direct DWR scrape failed for ${st.oldcode}:`, dwrErr);
         }
       }
       if (!dwrFallbackRecord) {
@@ -331,39 +335,43 @@ export class ThaiWaterIngestionService {
 
       // If ThaiWater data is delayed or missing, fallback to DWR direct scraper
       if ((freshness === "delayed" || freshness === "missing") && isDwr && st.oldcode) {
-        const dwrDaily = await dwrScraper.getDailyStation(st.oldcode);
-        if (dwrDaily) {
-          latestTime = dwrDaily.fetchedAt || new Date();
-          freshness = "fresh";
-          rain15m = dwrDaily.rain15m;
-          rain12h = dwrDaily.rain12h;
+        try {
+          const dwrDaily = await dwrScraper.getDailyStation(st.oldcode);
+          if (dwrDaily) {
+            latestTime = dwrDaily.fetchedAt || new Date();
+            freshness = "fresh";
+            rain15m = dwrDaily.rain15m;
+            rain12h = dwrDaily.rain12h;
 
-          // Rule: If previous telemetry exists, subtract previous 12h rain from current 12h rain
-          const [prev] = await db
-            .select({
-              rainfall12h: telemetryLatest.rainfall12h,
-              rainfall1h: telemetryLatest.rainfall1h,
-            })
-            .from(telemetryLatest)
-            .where(eq(telemetryLatest.stationId, st.id));
-          const prev12h = prev?.rainfall12h ?? prev?.rainfall1h ?? 0;
-          const diff = Number((dwrDaily.rain12h - prev12h).toFixed(1));
-          rain1h = diff >= 0 && diff <= 300 ? diff : rain15m;
-          dwrFallbackRecord = {
-            datetime: latestTime.toISOString(),
-            rainfallMm: rain1h,
-          };
-        } else {
-          const dwrRes = await dwrScraper.scrapeStationLatest(st.oldcode, { hourlyOnly: true });
-          if (dwrRes.success && dwrRes.latestRecord) {
-            const dwrTime = parseThaiWaterDate(dwrRes.latestRecord.datetime);
-            if (!isNaN(dwrTime.getTime()) && dwrTime.getTime() >= latestTime.getTime()) {
-              latestTime = dwrTime;
-              freshness = this.calculateFreshness(dwrTime);
-              rain1h = dwrRes.latestRecord.rainfallMm;
-              dwrFallbackRecord = dwrRes.latestRecord;
+            // Rule: If previous telemetry exists, subtract previous 12h rain from current 12h rain
+            const [prev] = await db
+              .select({
+                rainfall12h: telemetryLatest.rainfall12h,
+                rainfall1h: telemetryLatest.rainfall1h,
+              })
+              .from(telemetryLatest)
+              .where(eq(telemetryLatest.stationId, st.id));
+            const prev12h = prev?.rainfall12h ?? prev?.rainfall1h ?? 0;
+            const diff = Number((dwrDaily.rain12h - prev12h).toFixed(1));
+            rain1h = diff >= 0 && diff <= 300 ? diff : rain15m;
+            dwrFallbackRecord = {
+              datetime: latestTime.toISOString(),
+              rainfallMm: rain1h,
+            };
+          } else {
+            const dwrRes = await dwrScraper.scrapeStationLatest(st.oldcode, { hourlyOnly: true });
+            if (dwrRes.success && dwrRes.latestRecord) {
+              const dwrTime = parseThaiWaterDate(dwrRes.latestRecord.datetime);
+              if (!isNaN(dwrTime.getTime()) && dwrTime.getTime() >= latestTime.getTime()) {
+                latestTime = dwrTime;
+                freshness = this.calculateFreshness(dwrTime);
+                rain1h = dwrRes.latestRecord.rainfallMm;
+                dwrFallbackRecord = dwrRes.latestRecord;
+              }
             }
           }
+        } catch (dwrErr) {
+          console.warn(`⚠️ [ThaiWaterIngestion] DWR fallback failed for delayed station ${st.oldcode}:`, dwrErr);
         }
       }
     } else {

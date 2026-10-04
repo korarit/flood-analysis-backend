@@ -650,93 +650,71 @@ export class ThaiWaterBulkIngestionService {
           `🌧️ [${b.slug}] Found ${dwrFallbackCandidates.length} DWR stations delayed/missing in ThaiWater. Fallback fetching from DWR rain-daily...`
         );
 
-        const dwrDailyMap = await dwrScraper.fetchAllDailyRainStations();
+        try {
+          const dwrDailyMap = await dwrScraper.fetchAllDailyRainStations();
 
-        let refreshedCount = 0;
-        for (const candidate of dwrFallbackCandidates) {
-          const st = candidate.st;
-          const cleanCode = st.oldcode ? st.oldcode.replace(/\*/g, "").trim().toUpperCase() : "";
-          const dwrData = dwrDailyMap.get(cleanCode);
-          if (!dwrData) continue;
-
-          const dwrTime = dwrData.fetchedAt || new Date();
-          const dwrRain15m = dwrData.rain15m;
-
-          // Compute rain1h:
-          // Rule: If previous telemetry exists, subtract previous 12h rain from current 12h rain (rain12h - prev12h) to get current hour rain
-          const prev = prevTelemetryMap.get(st.id);
-          let dwrRain1h = dwrRain15m;
-          if (prev) {
-            const prev12h = prev.rainfall12h ?? prev.rainfall1h ?? 0;
-            const diff12h = Number((dwrData.rain12h - prev12h).toFixed(1));
-            if (diff12h >= 0 && diff12h <= 300) {
-              dwrRain1h = diff12h;
+          let refreshedCount = 0;
+          for (const candidate of dwrFallbackCandidates) {
+            const st = candidate.st;
+            const cleanCode = st.oldcode ? st.oldcode.replace(/\*/g, "").trim().toUpperCase() : "";
+            const dwrData = dwrDailyMap.get(cleanCode);
+            if (!dwrData) {
+              if (candidate.indexInUpsert === -1) {
+                // If station was completely missing in ThaiWater and also missing in DWR
+                failed++;
+              }
+              continue;
             }
-          }
 
-          const baseRain24h = candidate.existingRain24h ?? 0;
-          const rain24h = dwrData.rainDaily > 0 ? dwrData.rainDaily : Math.max(baseRain24h, dwrData.rain12h);
-          const rain3h = candidate.existingRain3h ? Math.max(candidate.existingRain3h, dwrRain1h) : dwrRain1h;
-          const rain6h = candidate.existingRain6h ? Math.max(candidate.existingRain6h, dwrRain1h) : dwrRain1h;
-          const rainToday = dwrData.rainDaily;
-          const dwrFreshness: FreshnessStatus = "fresh";
+            const dwrTime = dwrData.fetchedAt || new Date();
+            const dwrRain15m = dwrData.rain15m;
 
-          let situationStatus = this.evaluateSituationStatus({
-            isWaterlevel: false,
-            rain24h,
-            warningRain24h: st.warningRain24h || 35.0,
-            criticalRain24h: st.criticalRain24h || 90.0,
-          });
+            // Compute rain1h:
+            // Rule: If previous telemetry exists, subtract previous 12h rain from current 12h rain (rain12h - prev12h) to get current hour rain
+            const prev = prevTelemetryMap.get(st.id);
+            let dwrRain1h = dwrRain15m;
+            if (prev) {
+              const prev12h = prev.rainfall12h ?? prev.rainfall1h ?? 0;
+              const diff12h = Number((dwrData.rain12h - prev12h).toFixed(1));
+              if (diff12h >= 0 && diff12h <= 300) {
+                dwrRain1h = diff12h;
+              }
+            }
 
-          let alertReasonTh: string | null = null;
-          let alertReasonEn: string | null = null;
-          if (rain24h >= 150.0 || rain3h >= 100.0 || (rain24h >= 100.0 && (rain3h >= 30.0 || dwrRain1h >= 30.0))) {
-            situationStatus = "critical";
-            alertReasonTh = `ฝนตกหนักมากสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (DWR สด 15น: ${dwrRain15m.toFixed(1)} มม.) เสี่ยงน้ำท่วมฉับพลันและน้ำป่าไหลหลาก`;
-            alertReasonEn = `Critical heavy rainfall: 24h ${rain24h.toFixed(1)} mm (DWR 15m: ${dwrRain15m.toFixed(1)} mm). High flash flood risk.`;
-          } else if (rain24h >= 100.0 || (rain24h >= 90.0 && rain3h >= 20.0) || rain3h >= 50.0 || dwrRain1h >= 30.0) {
-            situationStatus = "warning";
-            alertReasonTh = `ฝนตกหนักสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (DWR สด 15น: ${dwrRain15m.toFixed(1)} มม.) โปรดเฝ้าระวังน้ำท่วมขังและน้ำหลาก`;
-            alertReasonEn = `Heavy rainfall alert: 24h ${rain24h.toFixed(1)} mm (DWR 15m: ${dwrRain15m.toFixed(1)} mm). Flood watch advised.`;
-          } else if (rain24h >= 35.0 || rain3h >= 20.0 || dwrRain1h >= 15.0) {
-            if (situationStatus === "normal") situationStatus = "watch";
-            alertReasonTh = `มีฝนตกต่อเนื่องสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (DWR สด 15น: ${dwrRain15m.toFixed(1)} มม.)`;
-            alertReasonEn = `Continuous moderate-to-heavy rain: 24h ${rain24h.toFixed(1)} mm (DWR 15m: ${dwrRain15m.toFixed(1)} mm).`;
-          }
+            const baseRain24h = candidate.existingRain24h ?? 0;
+            const rain24h = dwrData.rainDaily > 0 ? dwrData.rainDaily : Math.max(baseRain24h, dwrData.rain12h);
+            const rain3h = candidate.existingRain3h ? Math.max(candidate.existingRain3h, dwrRain1h) : dwrRain1h;
+            const rain6h = candidate.existingRain6h ? Math.max(candidate.existingRain6h, dwrRain1h) : dwrRain1h;
+            const rainToday = dwrData.rainDaily;
+            const dwrFreshness: FreshnessStatus = "fresh";
 
-          const updatedTelemetry: typeof telemetryLatest.$inferInsert = {
-            stationId: st.id,
-            basinId: st.basinId,
-            timestamp: dwrTime,
-            rainfall15m: dwrRain15m,
-            rainfall1h: dwrRain1h,
-            rainfall3h: rain3h,
-            rainfall6h: rain6h,
-            rainfall12h: dwrData.rain12h,
-            rainfall24h: rain24h,
-            rainfallToday: rainToday,
-            situationStatus,
-            freshnessStatus: dwrFreshness,
-            alertReasonTh,
-            alertReasonEn,
-            isUpstreamAlert: "false",
-            updatedAt: new Date(),
-          };
+            let situationStatus = this.evaluateSituationStatus({
+              isWaterlevel: false,
+              rain24h,
+              warningRain24h: st.warningRain24h || 35.0,
+              criticalRain24h: st.criticalRain24h || 90.0,
+            });
 
-          if (candidate.indexInUpsert >= 0) {
-            recordsToUpsert[candidate.indexInUpsert] = updatedTelemetry;
-          } else {
-            recordsToUpsert.push(updatedTelemetry);
-            synced++;
-          }
+            let alertReasonTh: string | null = null;
+            let alertReasonEn: string | null = null;
+            if (rain24h >= 150.0 || rain3h >= 100.0 || (rain24h >= 100.0 && (rain3h >= 30.0 || dwrRain1h >= 30.0))) {
+              situationStatus = "critical";
+              alertReasonTh = `ฝนตกหนักมากสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (DWR สด 15น: ${dwrRain15m.toFixed(1)} มม.) เสี่ยงน้ำท่วมฉับพลันและน้ำป่าไหลหลาก`;
+              alertReasonEn = `Critical heavy rainfall: 24h ${rain24h.toFixed(1)} mm (DWR 15m: ${dwrRain15m.toFixed(1)} mm). High flash flood risk.`;
+            } else if (rain24h >= 100.0 || (rain24h >= 90.0 && rain3h >= 20.0) || rain3h >= 50.0 || dwrRain1h >= 30.0) {
+              situationStatus = "warning";
+              alertReasonTh = `ฝนตกหนักสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (DWR สด 15น: ${dwrRain15m.toFixed(1)} มม.) โปรดเฝ้าระวังน้ำท่วมขังและน้ำหลาก`;
+              alertReasonEn = `Heavy rainfall alert: 24h ${rain24h.toFixed(1)} mm (DWR 15m: ${dwrRain15m.toFixed(1)} mm). Flood watch advised.`;
+            } else if (rain24h >= 35.0 || rain3h >= 20.0 || dwrRain1h >= 15.0) {
+              if (situationStatus === "normal") situationStatus = "watch";
+              alertReasonTh = `มีฝนตกต่อเนื่องสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (DWR สด 15น: ${dwrRain15m.toFixed(1)} มม.)`;
+              alertReasonEn = `Continuous moderate-to-heavy rain: 24h ${rain24h.toFixed(1)} mm (DWR 15m: ${dwrRain15m.toFixed(1)} mm).`;
+            }
 
-          if (writeStationCurrentJson) {
-            const rfItem: StationCurrentItem = {
-              timestamp: dwrTime.toISOString(),
-              status: situationStatus,
-              freshness: dwrFreshness,
-              alertReason: alertReasonTh ? { th: alertReasonTh, en: alertReasonEn || "" } : undefined,
-              isUpstreamAlert: false,
+            const updatedTelemetry: typeof telemetryLatest.$inferInsert = {
+              stationId: st.id,
+              basinId: st.basinId,
+              timestamp: dwrTime,
               rainfall15m: dwrRain15m,
               rainfall1h: dwrRain1h,
               rainfall3h: rain3h,
@@ -744,31 +722,68 @@ export class ThaiWaterBulkIngestionService {
               rainfall12h: dwrData.rain12h,
               rainfall24h: rain24h,
               rainfallToday: rainToday,
-              intensity: this.calculateRainIntensity(rain24h),
-              updatedAt: new Date().toISOString(),
+              situationStatus,
+              freshnessStatus: dwrFreshness,
+              alertReasonTh,
+              alertReasonEn,
+              isUpstreamAlert: "false",
+              updatedAt: new Date(),
             };
-            basinRfCurrentMap.get(b.slug)![st.id] = rfItem;
+
+            if (candidate.indexInUpsert >= 0) {
+              recordsToUpsert[candidate.indexInUpsert] = updatedTelemetry;
+            } else {
+              recordsToUpsert.push(updatedTelemetry);
+              synced++;
+            }
+
+            if (writeStationCurrentJson) {
+              const rfItem: StationCurrentItem = {
+                timestamp: dwrTime.toISOString(),
+                status: situationStatus,
+                freshness: dwrFreshness,
+                alertReason: alertReasonTh ? { th: alertReasonTh, en: alertReasonEn || "" } : undefined,
+                isUpstreamAlert: false,
+                rainfall15m: dwrRain15m,
+                rainfall1h: dwrRain1h,
+                rainfall3h: rain3h,
+                rainfall6h: rain6h,
+                rainfall12h: dwrData.rain12h,
+                rainfall24h: rain24h,
+                rainfallToday: rainToday,
+                intensity: this.calculateRainIntensity(rain24h),
+                updatedAt: new Date().toISOString(),
+              };
+              basinRfCurrentMap.get(b.slug)![st.id] = rfItem;
+            }
+
+            const rainObs = {
+              stationId: st.id,
+              rain1h: dwrRain1h,
+              rain3h,
+              rain24h,
+              nameTh: st.nameTh,
+              nameEn: st.nameEn,
+            };
+            basinRainMap.set(st.id, rainObs);
+            if (st.oldcode) {
+              basinRainMap.set(st.oldcode.toLowerCase(), rainObs);
+            }
+
+            refreshedCount++;
           }
 
-          const rainObs = {
-            stationId: st.id,
-            rain1h: dwrRain1h,
-            rain3h,
-            rain24h,
-            nameTh: st.nameTh,
-            nameEn: st.nameEn,
-          };
-          basinRainMap.set(st.id, rainObs);
-          if (st.oldcode) {
-            basinRainMap.set(st.oldcode.toLowerCase(), rainObs);
+          console.log(
+            `  ✨ [${b.slug}] Successfully refreshed ${refreshedCount}/${dwrFallbackCandidates.length} DWR stations via rain-daily in ${Date.now() - tDwrStart}ms`
+          );
+        } catch (dwrErr: any) {
+          console.warn(`⚠️ [${b.slug}] DWR fallback encountered error, gracefully proceeding with ThaiWater data:`, dwrErr?.message || dwrErr);
+          for (const candidate of dwrFallbackCandidates) {
+            if (candidate.indexInUpsert === -1) {
+              failed++;
+            }
           }
-
-          refreshedCount++;
         }
-
-        console.log(
-          `  ✨ [${b.slug}] Successfully refreshed ${refreshedCount}/${dwrFallbackCandidates.length} DWR stations via rain-daily in ${Date.now() - tDwrStart}ms`
-        );
       }
 
 

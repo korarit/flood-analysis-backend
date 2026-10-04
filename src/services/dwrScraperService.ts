@@ -318,23 +318,33 @@ export class DwrScraperService {
   private dailyCache: Map<string, DwrDailyRainStation> | null = null;
   private dailyCacheExpiry: number = 0;
   private isFetchingDaily: Promise<Map<string, DwrDailyRainStation>> | null = null;
+  private lastFetchFailedAt: number = 0;
+  private readonly FAILURE_COOLDOWN_MS = 60 * 1000; // 1 minute circuit-breaker cooldown
 
   /**
    * Fetches all daily rain stations from http://ews1.dwr.go.th/ews/rain-daily in ONE single request.
    * Returns a Map keyed by station code (uppercase).
    * Automatically cached in memory for 2 minutes to avoid re-fetching across multiple basins.
+   * Includes circuit breaker: if DWR is unreachable, it will back off for 1 minute instead of freezing every basin.
    */
   async fetchAllDailyRainStations(options: {
     forceRefresh?: boolean;
     timeoutMs?: number;
   } = {}): Promise<Map<string, DwrDailyRainStation>> {
-    const { forceRefresh = false, timeoutMs = 25000 } = options;
+    const { forceRefresh = false, timeoutMs = 10000 } = options;
     const now = Date.now();
 
+    // 1. Check active cache
     if (!forceRefresh && this.dailyCache && now < this.dailyCacheExpiry) {
       return this.dailyCache;
     }
 
+    // 2. Circuit Breaker: If recently failed, don't hammer the down server, return stale cache or empty map
+    if (!forceRefresh && now - this.lastFetchFailedAt < this.FAILURE_COOLDOWN_MS) {
+      return this.dailyCache || new Map<string, DwrDailyRainStation>();
+    }
+
+    // 3. Deduplicate in-flight requests
     if (this.isFetchingDaily) {
       return this.isFetchingDaily;
     }
@@ -354,20 +364,22 @@ export class DwrScraperService {
               html = await res.text();
               break;
             }
-          } catch (err) {
-            // try next url
+          } catch (err: any) {
+            // Failover to next URL
           }
         }
 
         if (!html) {
-          console.warn("⚠️ [DwrScraper] Failed to fetch rain-daily from both HTTP and HTTPS");
+          this.lastFetchFailedAt = Date.now();
+          console.warn("⚠️ [DwrScraper] Failed to fetch rain-daily from both HTTP and HTTPS endpoints");
           return this.dailyCache || new Map<string, DwrDailyRainStation>();
         }
 
         // Parse tableData-rain_12 (or tableData-rain_24)
         const match = html.match(/<table[^>]*tableData-rain_12[^>]*>([\s\S]*?)<\/table>/i);
         if (!match) {
-          console.warn("⚠️ [DwrScraper] Could not find tableData-rain_12 in rain-daily HTML");
+          this.lastFetchFailedAt = Date.now();
+          console.warn("⚠️ [DwrScraper] Could not find tableData-rain_12 in rain-daily HTML response");
           return this.dailyCache || new Map<string, DwrDailyRainStation>();
         }
 
@@ -391,27 +403,45 @@ export class DwrScraperService {
             const wl = parseFloat(cells[12]);
             const hum = parseFloat(cells[13]);
 
+            // Data sanitization with physical upper & lower bounds:
+            const safeRain15m = isNaN(rain15m) || rain15m < 0 || rain15m > 300 ? 0 : rain15m;
+            const safeRain12h = isNaN(rain12h) || rain12h < 0 || rain12h > 1000 ? 0 : rain12h;
+            const safeRainDaily = isNaN(rainDaily) || rainDaily < 0 || rainDaily > 1500 ? 0 : rainDaily;
+            const safeTemp = isNaN(temp) || temp < -10 || temp > 65 ? null : temp;
+            const safeWl = isNaN(wl) ? null : wl;
+            const safeHum = isNaN(hum) || hum < 0 || hum > 100 ? null : hum;
+
             resultMap.set(rawCode, {
               stationCode: rawCode,
               name: cells[2] || "",
               tambon: cells[3] || "",
               amphoe: cells[4] || "",
               province: cells[5] || "",
-              rain15m: isNaN(rain15m) || rain15m < 0 ? 0 : rain15m,
-              rain12h: isNaN(rain12h) || rain12h < 0 ? 0 : rain12h,
-              rainDaily: isNaN(rainDaily) || rainDaily < 0 ? 0 : rainDaily,
-              temperature: isNaN(temp) ? null : temp,
-              waterLevel: isNaN(wl) ? null : wl,
-              humidity: isNaN(hum) ? null : hum,
+              rain15m: safeRain15m,
+              rain12h: safeRain12h,
+              rainDaily: safeRainDaily,
+              temperature: safeTemp,
+              waterLevel: safeWl,
+              humidity: safeHum,
               fetchedAt,
             });
           }
         }
 
-        this.dailyCache = resultMap;
-        this.dailyCacheExpiry = Date.now() + 2 * 60 * 1000; // 2 minutes TTL
-        console.log(`🌧️ [DwrScraper] Fetched & cached ${resultMap.size} DWR stations from rain-daily`);
-        return resultMap;
+        if (resultMap.size > 0) {
+          this.dailyCache = resultMap;
+          this.dailyCacheExpiry = Date.now() + 2 * 60 * 1000; // 2 minutes TTL
+          this.lastFetchFailedAt = 0; // Reset failure timestamp
+          console.log(`🌧️ [DwrScraper] Fetched & cached ${resultMap.size} DWR stations from rain-daily`);
+        } else {
+          console.warn("⚠️ [DwrScraper] Parsed 0 stations from rain-daily, preserving existing cache if available");
+        }
+
+        return resultMap.size > 0 ? resultMap : (this.dailyCache || new Map<string, DwrDailyRainStation>());
+      } catch (err: any) {
+        this.lastFetchFailedAt = Date.now();
+        console.warn("⚠️ [DwrScraper] Unexpected error fetching rain-daily stations:", err?.message || err);
+        return this.dailyCache || new Map<string, DwrDailyRainStation>();
       } finally {
         this.isFetchingDaily = null;
       }
@@ -424,9 +454,13 @@ export class DwrScraperService {
    * Quick lookup of a single station from the rain-daily feed.
    */
   async getDailyStation(stationCode: string): Promise<DwrDailyRainStation | null> {
-    const map = await this.fetchAllDailyRainStations();
-    const clean = stationCode.replace(/\*/g, "").trim().toUpperCase();
-    return map.get(clean) || null;
+    try {
+      const map = await this.fetchAllDailyRainStations();
+      const clean = stationCode.replace(/\*/g, "").trim().toUpperCase();
+      return map.get(clean) || null;
+    } catch {
+      return null;
+    }
   }
 }
 
