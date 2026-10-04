@@ -6,6 +6,8 @@
  * (ews1 HTTP avoids TLS handshake overhead, 10x faster than HTTPS in Thailand)
  */
 
+import { r2Storage } from "./r2StorageService";
+
 export interface DwrRainfallRecord {
   stationCode: string;
   datetime: string; // ISO / Bangkok: "YYYY-MM-DD HH:mm:00"
@@ -515,6 +517,34 @@ export class DwrScraperService {
     } catch {
       return null;
     }
+  }
+
+  private inactiveStationsCache: Set<string> | null = null;
+  private inactiveStationsExpiry: number = 0;
+
+  /**
+   * Loads the list of inactive DWR stations (> 5 days without update) from R2 or local fallback.
+   * Cached in memory for 10 minutes.
+   */
+  async loadInactiveStations(options: { forceRefresh?: boolean } = {}): Promise<Set<string>> {
+    const { forceRefresh = false } = options;
+    const now = Date.now();
+    if (!forceRefresh && this.inactiveStationsCache && now < this.inactiveStationsExpiry) {
+      return this.inactiveStationsCache;
+    }
+
+    try {
+      const data = await r2Storage.getJson<string[]>("dwr/inactive_stations.json");
+      if (Array.isArray(data)) {
+        this.inactiveStationsCache = new Set(data.map((c) => c.replace(/\*/g, "").trim().toUpperCase()));
+        this.inactiveStationsExpiry = now + 10 * 60 * 1000; // 10 minutes cache
+        return this.inactiveStationsCache;
+      }
+    } catch (err) {
+      console.warn("⚠️ [DwrScraper] Could not load inactive stations list from R2:", err);
+    }
+
+    return this.inactiveStationsCache || new Set<string>();
   }
 
   private provinceCache = new Map<string, { data: Map<string, DwrProvinceStation>; expiry: number }>();
