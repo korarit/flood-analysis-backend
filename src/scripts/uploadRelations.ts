@@ -18,12 +18,27 @@ import { basins } from "../db/schema";
 import { r2Publisher } from "../services/r2PublisherService";
 import { stationImporter } from "../services/stationImporterService";
 
+import { ensureBasinStationsInDb, ensureBasinsInDb } from "../config/basins";
+
 // ---------------------------------------------------------------------------
 // CLI args
 // ---------------------------------------------------------------------------
 const args = process.argv.slice(2);
-const targetBasin = args.find((a) => a.startsWith("--basin="))?.split("=")[1] ?? null;
+let targetBasin: string | null = null;
 const isDryRun = args.includes("--dry-run");
+
+for (const arg of args) {
+  if (arg === "--dry-run") continue;
+  if (arg.startsWith("--basin=")) {
+    const val = arg.split("=")[1]?.trim();
+    targetBasin = val?.toLowerCase() === "all" ? null : val;
+  } else if (arg === "--all" || arg.toLowerCase() === "all") {
+    targetBasin = null;
+  } else if (!arg.startsWith("--")) {
+    const val = arg.trim();
+    targetBasin = val.toLowerCase() === "all" ? null : val;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -41,6 +56,9 @@ async function main() {
   }
 
   console.log(`📂 Model dataset dir: ${modelDir}\n`);
+
+  // Ensure target basin or all master basins exist in PostgreSQL
+  await ensureBasinsInDb(targetBasin ? [targetBasin] : undefined);
 
   // Discover basin folders (only active basins in DB)
   const dbBasins = await db.select({ slug: basins.slug }).from(basins);
@@ -98,6 +116,9 @@ async function main() {
     }
 
     try {
+      // Ensure station records exist in DB for this basin so relations can bind properly
+      await ensureBasinStationsInDb(slug);
+
       // 1. Parse relation file
       const data = JSON.parse(readFileSync(targetFile, "utf-8"));
       if (!Array.isArray(data)) {

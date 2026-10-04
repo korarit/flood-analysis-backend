@@ -4,6 +4,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { basins } from "../db/schema";
 import { getModelDatasetDir } from "../config/paths";
+import { ensureBasinsInDb } from "../config/basins";
 import { r2Publisher } from "../services/r2PublisherService";
 
 // Mapping of basin slug to ThaiWater Thai Name for fallback online downloader
@@ -119,6 +120,7 @@ async function main() {
   console.log(`⏰ Started at:       ${new Date().toLocaleString("th-TH")}`);
   console.log(`🎯 Target:           ${targetBasin ? `Basin '${targetBasin}'` : "All Basins"}`);
   console.log("-------------------------------------------------------------------\n");
+  await ensureBasinsInDb(targetBasin ? [targetBasin] : undefined);
 
   const allBasins = targetBasin
     ? await db.select().from(basins).where(eq(basins.slug, targetBasin))

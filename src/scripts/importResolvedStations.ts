@@ -5,6 +5,7 @@ import { basins, rainfallStations, stationRelations, waterlevelStations, telemet
 import { StationImporterService } from "../services/stationImporterService";
 import { getModelDatasetDir } from "../config/paths";
 import { eq, sql } from "drizzle-orm";
+import { MASTER_BASINS, ensureBasinsInDb } from "../config/basins";
 
 async function main() {
   console.log("========================================================");
@@ -18,10 +19,13 @@ async function main() {
     process.exit(1);
   }
 
+
   const args = process.argv.slice(2);
   const basinArg = args.find((a) => a.startsWith("--basin="))?.split("=")[1] || (args[0] && !args[0].startsWith("-") ? args[0] : null);
-  const defaultBasins = ["yom", "ping", "nan", "wang", "chi", "khong-north", "mun", "pa-sak"];
+  const defaultBasins = MASTER_BASINS.map((b) => b.slug);
   const targetBasins = basinArg ? [basinArg.toLowerCase().trim()] : defaultBasins;
+
+  await ensureBasinsInDb(targetBasins);
 
   let totalWaterlevelImported = 0;
   let totalRainfallImported = 0;

@@ -21,72 +21,22 @@ import { formatBangkokDate } from "../utils/date";
 import { llmBulletinService } from "./llmBulletinService";
 import { r2Storage } from "./r2StorageService";
 
+import { MASTER_BASINS } from "../config/basins";
+
 const BASIN_METADATA_EXTRAS: Record<
   string,
   { bgGradient: string; accentColor: string; center: [number, number]; zoom: number }
-> = {
-  yom: { bgGradient: "from-teal-950 via-slate-900 to-cyan-950", accentColor: "#06B6D4", center: [17.5, 100.0], zoom: 8 },
-  nan: { bgGradient: "from-blue-950 via-slate-900 to-indigo-950", accentColor: "#3B82F6", center: [18.2, 100.8], zoom: 8 },
-  ping: { bgGradient: "from-sky-950 via-slate-900 to-blue-950", accentColor: "#0EA5E9", center: [18.5, 99.0], zoom: 8 },
-  wang: { bgGradient: "from-emerald-950 via-slate-900 to-slate-950", accentColor: "#10B981", center: [17.8, 99.2], zoom: 8 },
-  mun: { bgGradient: "from-amber-950 via-slate-900 to-slate-950", accentColor: "#F59E0B", center: [15.2, 103.5], zoom: 8 },
-  chi: { bgGradient: "from-violet-950 via-slate-900 to-slate-950", accentColor: "#8B5CF6", center: [16.0, 102.8], zoom: 8 },
-  "khong-north": { bgGradient: "from-cyan-950 via-slate-900 to-teal-950", accentColor: "#14B8A6", center: [19.8, 100.0], zoom: 8 },
-  "pa-sak": { bgGradient: "from-emerald-950 via-slate-900 to-teal-950", accentColor: "#10B981", center: [15.8, 101.1], zoom: 8 },
-};
+> = Object.fromEntries(
+  MASTER_BASINS.map((b) => [
+    b.slug,
+    { bgGradient: b.bgGradient, accentColor: b.accentColor, center: b.center, zoom: b.zoom },
+  ])
+);
 
-const BASIN_MAIN_RIVERS: Record<string, Array<{ th: string; en: string }>> = {
-  yom: [
-    { th: "แม่น้ำยม", en: "Yom River" },
-    { th: "ลำน้ำควร", en: "Khuan River" },
-    { th: "แม่น้ำงาว", en: "Ngao River" },
-    { th: "คลองหกบาท", en: "Khlong Hok Bat" },
-  ],
-  nan: [
-    { th: "แม่น้ำน่าน", en: "Nan River" },
-    { th: "แม่น้ำว้า", en: "Wa River" },
-    { th: "แม่น้ำปาด", en: "Pat River" },
-    { th: "แม่น้ำแควน้อย", en: "Khwae Noi River" },
-  ],
-  ping: [
-    { th: "แม่น้ำปิง", en: "Ping River" },
-    { th: "แม่น้ำกวง", en: "Kuang River" },
-    { th: "แม่น้ำแจ่ม", en: "Chaem River" },
-    { th: "แม่น้ำงัด", en: "Ngat River" },
-  ],
-  wang: [
-    { th: "แม่น้ำวัง", en: "Wang River" },
-    { th: "แม่น้ำตุ๋ย", en: "Tui River" },
-    { th: "แม่น้ำจาง", en: "Chang River" },
-    { th: "แม่น้ำสอย", en: "Soi River" },
-  ],
-  mun: [
-    { th: "แม่น้ำมูล", en: "Mun River" },
-    { th: "ลำตะคอง", en: "Lam Takhong" },
-    { th: "ลำพระเพลิง", en: "Lam Phra Phloeng" },
-    { th: "ลำเซบาย", en: "Lam Se Bai" },
-    { th: "ลำโดมใหญ่", en: "Lam Dom Yai" },
-  ],
-  chi: [
-    { th: "แม่น้ำชี", en: "Chi River" },
-    { th: "ลำน้ำพอง", en: "Lam Nam Phong" },
-    { th: "ลำปาว", en: "Lam Pao" },
-    { th: "ลำน้ำเชิญ", en: "Lam Nam Choen" },
-  ],
-  "khong-north": [
-    { th: "แม่น้ำโขง", en: "Mekong River" },
-    { th: "แม่น้ำกก", en: "Kok River" },
-    { th: "แม่น้ำสาย", en: "Sai River" },
-    { th: "แม่น้ำอิง", en: "Ing River" },
-  ],
-  "pa-sak": [
-    { th: "แม่น้ำป่าสัก", en: "Pa Sak River" },
-    { th: "ลำสนธิ", en: "Lam Sonthi" },
-    { th: "ห้วยป่าแดง", en: "Huai Pa Daeng" },
-    { th: "ลำพญากลาง", en: "Lam Phraya Klang" },
-    { th: "แม่น้ำลพบุรี", en: "Lopburi River" },
-  ],
-};
+const BASIN_MAIN_RIVERS: Record<string, Array<{ th: string; en: string }>> = Object.fromEntries(
+  MASTER_BASINS.map((b) => [b.slug, b.mainRivers])
+);
+
 /**
  * Hybrid Percentage-Based Basin Overall Situation Status Evaluation:
  * - Differentiates Water Level (river channel inundation) vs Rainfall (risk indicator)
@@ -683,6 +633,11 @@ export class R2PublisherService {
     const rfListPath = `rainfall_station/${b.slug}/stations.json`;
     await r2Storage.putJson(rfListPath, { ...payload, totalStations: rfStationsList.length, stations: rfStationsList }, "public, max-age=60, s-maxage=120");
     await this.registerDataset(b.id, "stations_rainfall", rfListPath);
+
+    // 2. Publish unified list: basin/{basin}/stations.json
+    const unifiedPath = `basin/${b.slug}/stations.json`;
+    await r2Storage.putJson(unifiedPath, payload, "public, max-age=60, s-maxage=120");
+    await this.registerDataset(b.id, "stations_all", unifiedPath);
   }
 
   /**
