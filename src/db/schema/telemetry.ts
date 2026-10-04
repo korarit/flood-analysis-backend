@@ -8,11 +8,14 @@ export const telemetryLatest = pgTable("telemetry_latest", {
   discharge: doublePrecision("discharge"), // cms (m3/s)
   waterLevelMsl: doublePrecision("water_level_msl"), // m MSL
   storagePercent: doublePrecision("storage_percent"), // %
+  rainfall15m: doublePrecision("rainfall_15m"), // mm
   rainfall1h: doublePrecision("rainfall_1h"), // mm
   rainfall3h: doublePrecision("rainfall_3h"), // mm
   rainfall6h: doublePrecision("rainfall_6h"), // mm
+  rainfall12h: doublePrecision("rainfall_12h"), // mm
   rainfall24h: doublePrecision("rainfall_24h"), // mm
   rainfallToday: doublePrecision("rainfall_today"), // mm
+
   trend: varchar("trend", { length: 32 }), // 'rising' | 'steady' | 'falling'
   situationStatus: varchar("situation_status", { length: 32 }).default("normal").notNull(), // 'normal' | 'watch' | 'warning' | 'critical' | 'missing'
   freshnessStatus: varchar("freshness_status", { length: 32 }).default("fresh").notNull(), // 'fresh' | 'delayed' | 'missing'

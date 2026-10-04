@@ -14,6 +14,9 @@ import {
 import { formatBangkokDateTime, parseThaiWaterDate } from "../utils/date";
 import { r2Publisher } from "./r2PublisherService";
 import { r2Storage } from "./r2StorageService";
+import { dwrScraper, DwrScrapeResult } from "./dwrScraperService";
+
+
 
 export interface ThaiWaterBulkRainfallItem {
   id?: string;
@@ -137,6 +140,19 @@ export class ThaiWaterBulkIngestionService {
   private formatDateTime(d: Date): string {
     return formatBangkokDateTime(d);
   }
+
+  public isDwrStation(st: {
+    oldcode?: string | null;
+    agencyShortnameEn?: string | null;
+    agencyShortnameTh?: string | null;
+  }): boolean {
+    if (!st.oldcode || !st.oldcode.trim()) return false;
+    const code = st.oldcode.trim().toUpperCase();
+    const agencyEn = (st.agencyShortnameEn || "").trim().toUpperCase();
+    const agencyTh = (st.agencyShortnameTh || "").trim();
+    return code.startsWith("STN") || agencyEn === "DWR" || agencyTh.includes("ทน") || agencyTh.includes("ทสน");
+  }
+
 
   /**
    * Fetch with timeout and exponential backoff retry
@@ -379,6 +395,24 @@ export class ThaiWaterBulkIngestionService {
       const waterList = await db.select().from(waterlevelStations).where(eq(waterlevelStations.basinId, b.id));
       totalStations += rainList.length + waterList.length;
 
+      // Pre-load previous telemetry in this basin for DWR 12h/15m delta calculation
+      const existingTelemetry = await db
+        .select({
+          stationId: telemetryLatest.stationId,
+          rainfall15m: telemetryLatest.rainfall15m,
+          rainfall1h: telemetryLatest.rainfall1h,
+          rainfall12h: telemetryLatest.rainfall12h,
+          rainfall24h: telemetryLatest.rainfall24h,
+        })
+        .from(telemetryLatest)
+        .where(eq(telemetryLatest.basinId, b.id));
+
+      const prevTelemetryMap = new Map<string, (typeof existingTelemetry)[0]>();
+      for (const row of existingTelemetry) {
+        prevTelemetryMap.set(row.stationId, row);
+      }
+
+
       // Track basin rain observations for upstream correlation
       const basinRainMap = new Map<
         string,
@@ -457,7 +491,17 @@ export class ThaiWaterBulkIngestionService {
         `🌧️ [${b.slug}] Fetched c60 hourly data for ${hourlyRainMap.size}/${rainList.length} stations in ${Date.now() - tC60}ms (30 workers)`
       );
 
-      // 3.2 Process Rainfall Stations
+      // 3.2 Process Rainfall Stations (with DWR Smart Fallback tracking)
+      const dwrFallbackCandidates: Array<{
+        st: typeof rainfallStations.$inferSelect;
+        reason: "missing_thaiwater" | "delayed" | "missing";
+        indexInUpsert: number;
+        existingRain24h?: number;
+        existingRain3h?: number;
+        existingRain6h?: number;
+        existingTime?: Date;
+      }> = [];
+
       for (const st of rainList) {
         const obs =
           rainById.get(st.id) ||
@@ -465,7 +509,16 @@ export class ThaiWaterBulkIngestionService {
           null;
 
         if (!obs) {
-          failed++;
+          // If station is DWR, queue it for DWR direct fallback scrape instead of failing immediately
+          if (this.isDwrStation(st)) {
+            dwrFallbackCandidates.push({
+              st,
+              reason: "missing_thaiwater",
+              indexInUpsert: -1,
+            });
+          } else {
+            failed++;
+          }
           continue;
         }
 
@@ -519,14 +572,17 @@ export class ThaiWaterBulkIngestionService {
         }
 
         const freshness = this.calculateFreshness(latestTime);
+        const upsertIdx = recordsToUpsert.length;
 
         recordsToUpsert.push({
           stationId: st.id,
           basinId: st.basinId,
           timestamp: latestTime,
+          rainfall15m: null,
           rainfall1h: rain1h,
           rainfall3h: rain3h,
           rainfall6h: rain6h,
+          rainfall12h: null,
           rainfall24h: rain24h,
           rainfallToday: rainToday,
           situationStatus,
@@ -544,9 +600,11 @@ export class ThaiWaterBulkIngestionService {
             freshness,
             alertReason: alertReasonTh ? { th: alertReasonTh, en: alertReasonEn || "" } : undefined,
             isUpstreamAlert: false,
+            rainfall15m: null,
             rainfall1h: rain1h,
             rainfall3h: rain3h,
             rainfall6h: rain6h,
+            rainfall12h: null,
             rainfall24h: rain24h,
             rainfallToday: rainToday,
             intensity: this.calculateRainIntensity(rain24h),
@@ -569,7 +627,150 @@ export class ThaiWaterBulkIngestionService {
         }
 
         synced++;
+
+        // If this DWR station is delayed or missing in ThaiWater, queue for DWR rain-daily scrape
+        if ((freshness === "delayed" || freshness === "missing") && this.isDwrStation(st)) {
+          dwrFallbackCandidates.push({
+            st,
+            reason: freshness,
+            indexInUpsert: upsertIdx,
+            existingRain24h: rain24h,
+            existingRain3h: rain3h,
+            existingRain6h: rain6h,
+            existingTime: latestTime,
+          });
+        }
       }
+
+      // 3.2.1 DWR Smart Fallback Engine via https://ews1.dwr.go.th/ews/rain-daily:
+      // Fetches all DWR stations nationwide in ONE single request, cached for 2 mins across basins
+      if (dwrFallbackCandidates.length > 0) {
+        const tDwrStart = Date.now();
+        console.log(
+          `🌧️ [${b.slug}] Found ${dwrFallbackCandidates.length} DWR stations delayed/missing in ThaiWater. Fallback fetching from DWR rain-daily...`
+        );
+
+        const dwrDailyMap = await dwrScraper.fetchAllDailyRainStations();
+
+        let refreshedCount = 0;
+        for (const candidate of dwrFallbackCandidates) {
+          const st = candidate.st;
+          const cleanCode = st.oldcode ? st.oldcode.replace(/\*/g, "").trim().toUpperCase() : "";
+          const dwrData = dwrDailyMap.get(cleanCode);
+          if (!dwrData) continue;
+
+          const dwrTime = dwrData.fetchedAt || new Date();
+          const dwrRain15m = dwrData.rain15m;
+
+          // Compute rain1h:
+          // Rule: If previous telemetry exists, subtract previous 12h rain from current 12h rain (rain12h - prev12h) to get current hour rain
+          const prev = prevTelemetryMap.get(st.id);
+          let dwrRain1h = dwrRain15m;
+          if (prev) {
+            const prev12h = prev.rainfall12h ?? prev.rainfall1h ?? 0;
+            const diff12h = Number((dwrData.rain12h - prev12h).toFixed(1));
+            if (diff12h >= 0 && diff12h <= 300) {
+              dwrRain1h = diff12h;
+            }
+          }
+
+          const baseRain24h = candidate.existingRain24h ?? 0;
+          const rain24h = dwrData.rainDaily > 0 ? dwrData.rainDaily : Math.max(baseRain24h, dwrData.rain12h);
+          const rain3h = candidate.existingRain3h ? Math.max(candidate.existingRain3h, dwrRain1h) : dwrRain1h;
+          const rain6h = candidate.existingRain6h ? Math.max(candidate.existingRain6h, dwrRain1h) : dwrRain1h;
+          const rainToday = dwrData.rainDaily;
+          const dwrFreshness: FreshnessStatus = "fresh";
+
+          let situationStatus = this.evaluateSituationStatus({
+            isWaterlevel: false,
+            rain24h,
+            warningRain24h: st.warningRain24h || 35.0,
+            criticalRain24h: st.criticalRain24h || 90.0,
+          });
+
+          let alertReasonTh: string | null = null;
+          let alertReasonEn: string | null = null;
+          if (rain24h >= 150.0 || rain3h >= 100.0 || (rain24h >= 100.0 && (rain3h >= 30.0 || dwrRain1h >= 30.0))) {
+            situationStatus = "critical";
+            alertReasonTh = `ฝนตกหนักมากสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (DWR สด 15น: ${dwrRain15m.toFixed(1)} มม.) เสี่ยงน้ำท่วมฉับพลันและน้ำป่าไหลหลาก`;
+            alertReasonEn = `Critical heavy rainfall: 24h ${rain24h.toFixed(1)} mm (DWR 15m: ${dwrRain15m.toFixed(1)} mm). High flash flood risk.`;
+          } else if (rain24h >= 100.0 || (rain24h >= 90.0 && rain3h >= 20.0) || rain3h >= 50.0 || dwrRain1h >= 30.0) {
+            situationStatus = "warning";
+            alertReasonTh = `ฝนตกหนักสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (DWR สด 15น: ${dwrRain15m.toFixed(1)} มม.) โปรดเฝ้าระวังน้ำท่วมขังและน้ำหลาก`;
+            alertReasonEn = `Heavy rainfall alert: 24h ${rain24h.toFixed(1)} mm (DWR 15m: ${dwrRain15m.toFixed(1)} mm). Flood watch advised.`;
+          } else if (rain24h >= 35.0 || rain3h >= 20.0 || dwrRain1h >= 15.0) {
+            if (situationStatus === "normal") situationStatus = "watch";
+            alertReasonTh = `มีฝนตกต่อเนื่องสะสม 24 ชม. ${rain24h.toFixed(1)} มม. (DWR สด 15น: ${dwrRain15m.toFixed(1)} มม.)`;
+            alertReasonEn = `Continuous moderate-to-heavy rain: 24h ${rain24h.toFixed(1)} mm (DWR 15m: ${dwrRain15m.toFixed(1)} mm).`;
+          }
+
+          const updatedTelemetry: typeof telemetryLatest.$inferInsert = {
+            stationId: st.id,
+            basinId: st.basinId,
+            timestamp: dwrTime,
+            rainfall15m: dwrRain15m,
+            rainfall1h: dwrRain1h,
+            rainfall3h: rain3h,
+            rainfall6h: rain6h,
+            rainfall12h: dwrData.rain12h,
+            rainfall24h: rain24h,
+            rainfallToday: rainToday,
+            situationStatus,
+            freshnessStatus: dwrFreshness,
+            alertReasonTh,
+            alertReasonEn,
+            isUpstreamAlert: "false",
+            updatedAt: new Date(),
+          };
+
+          if (candidate.indexInUpsert >= 0) {
+            recordsToUpsert[candidate.indexInUpsert] = updatedTelemetry;
+          } else {
+            recordsToUpsert.push(updatedTelemetry);
+            synced++;
+          }
+
+          if (writeStationCurrentJson) {
+            const rfItem: StationCurrentItem = {
+              timestamp: dwrTime.toISOString(),
+              status: situationStatus,
+              freshness: dwrFreshness,
+              alertReason: alertReasonTh ? { th: alertReasonTh, en: alertReasonEn || "" } : undefined,
+              isUpstreamAlert: false,
+              rainfall15m: dwrRain15m,
+              rainfall1h: dwrRain1h,
+              rainfall3h: rain3h,
+              rainfall6h: rain6h,
+              rainfall12h: dwrData.rain12h,
+              rainfall24h: rain24h,
+              rainfallToday: rainToday,
+              intensity: this.calculateRainIntensity(rain24h),
+              updatedAt: new Date().toISOString(),
+            };
+            basinRfCurrentMap.get(b.slug)![st.id] = rfItem;
+          }
+
+          const rainObs = {
+            stationId: st.id,
+            rain1h: dwrRain1h,
+            rain3h,
+            rain24h,
+            nameTh: st.nameTh,
+            nameEn: st.nameEn,
+          };
+          basinRainMap.set(st.id, rainObs);
+          if (st.oldcode) {
+            basinRainMap.set(st.oldcode.toLowerCase(), rainObs);
+          }
+
+          refreshedCount++;
+        }
+
+        console.log(
+          `  ✨ [${b.slug}] Successfully refreshed ${refreshedCount}/${dwrFallbackCandidates.length} DWR stations via rain-daily in ${Date.now() - tDwrStart}ms`
+        );
+      }
+
 
       // Pre-build upstream waterlevel map from downstream relations within this basin
       const upstreamWaterMap = new Map<
@@ -826,9 +1027,11 @@ export class ThaiWaterBulkIngestionService {
             discharge: sql`EXCLUDED.discharge`,
             waterLevelMsl: sql`EXCLUDED.water_level_msl`,
             storagePercent: sql`EXCLUDED.storage_percent`,
+            rainfall15m: sql`EXCLUDED.rainfall_15m`,
             rainfall1h: sql`EXCLUDED.rainfall_1h`,
             rainfall3h: sql`EXCLUDED.rainfall_3h`,
             rainfall6h: sql`EXCLUDED.rainfall_6h`,
+            rainfall12h: sql`EXCLUDED.rainfall_12h`,
             rainfall24h: sql`EXCLUDED.rainfall_24h`,
             rainfallToday: sql`EXCLUDED.rainfall_today`,
             trend: sql`EXCLUDED.trend`,

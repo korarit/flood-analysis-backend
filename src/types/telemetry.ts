@@ -46,9 +46,11 @@ export interface StationCurrentDataset {
     };
   };
   rainfall?: {
+    value15m?: number | null;
     value1h: number | null;
     value3h?: number | null;
     value6h?: number | null;
+    value12h?: number | null;
     value24h: number | null;
     valueToday: number | null;
     intensity: RainIntensity;
@@ -70,9 +72,11 @@ export interface StationCurrentItem {
   waterLevelMsl?: number | null;
   storagePercent?: number | null;
   trend?: TrendDirection;
+  rainfall15m?: number | null;
   rainfall1h?: number | null;
   rainfall3h?: number | null;
   rainfall6h?: number | null;
+  rainfall12h?: number | null;
   rainfall24h?: number | null;
   rainfallToday?: number | null;
   intensity?: RainIntensity;

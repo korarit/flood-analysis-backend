@@ -6,6 +6,8 @@ import { FreshnessStatus, RainIntensity, SituationStatus, StationCurrentDataset,
 import { formatBangkokDate, formatBangkokDateTime, parseThaiWaterDate } from "../utils/date";
 import { r2Publisher } from "./r2PublisherService";
 import { r2Storage } from "./r2StorageService";
+import { dwrScraper } from "./dwrScraperService";
+
 
 export interface ThaiWaterHourlyRainItem {
   datetime: string;
@@ -284,25 +286,110 @@ export class ThaiWaterIngestionService {
     latestRain?: { stationId: string; rain1h: number; rain3h: number; rain24h: number; lat: number; nameTh: string; nameEn: string };
   }> {
     const rainRes = await this.fetchRainfallGraph(st.id);
-    if (!rainRes || !rainRes.data || rainRes.data.length === 0) {
-      return { ok: false };
+    const isDwr = Boolean(
+      st.oldcode &&
+      (st.oldcode.trim().toUpperCase().startsWith("STN") || st.agencyShortnameEn?.toUpperCase() === "DWR")
+    );
+
+    let dwrFallbackRecord: { datetime: string; rainfallMm: number } | null = null;
+    let rain15m: number | null = null;
+    let rain12h: number | null = null;
+    let items = (rainRes?.data || []).filter((d) => d.value !== null);
+
+    // If ThaiWater has no data and station is DWR, fallback directly to DWR
+    if (items.length === 0) {
+      if (isDwr && st.oldcode) {
+        const dwrDaily = await dwrScraper.getDailyStation(st.oldcode);
+        if (dwrDaily) {
+          rain15m = dwrDaily.rain15m;
+          rain12h = dwrDaily.rain12h;
+          dwrFallbackRecord = {
+            datetime: (dwrDaily.fetchedAt || new Date()).toISOString(),
+            rainfallMm: dwrDaily.rain15m,
+          };
+        } else {
+          const dwrRes = await dwrScraper.scrapeStationLatest(st.oldcode, { hourlyOnly: true });
+          if (dwrRes.success && dwrRes.latestRecord) {
+            dwrFallbackRecord = dwrRes.latestRecord;
+          }
+        }
+      }
+      if (!dwrFallbackRecord) {
+        return { ok: false };
+      }
     }
 
-    const items = rainRes.data.filter((d) => d.value !== null);
-    if (items.length === 0) return { ok: false };
+    let latestTime: Date;
+    let rain1h: number;
+    let freshness: FreshnessStatus;
 
-    const latestItem = items[items.length - 1];
-    const latestTime = parseThaiWaterDate(latestItem.datetime);
-    const rain1h = latestItem.value || 0;
+    if (items.length > 0) {
+      const latestItem = items[items.length - 1];
+      latestTime = parseThaiWaterDate(latestItem.datetime);
+      freshness = this.calculateFreshness(latestTime);
+      rain1h = latestItem.value || 0;
+
+      // If ThaiWater data is delayed or missing, fallback to DWR direct scraper
+      if ((freshness === "delayed" || freshness === "missing") && isDwr && st.oldcode) {
+        const dwrDaily = await dwrScraper.getDailyStation(st.oldcode);
+        if (dwrDaily) {
+          latestTime = dwrDaily.fetchedAt || new Date();
+          freshness = "fresh";
+          rain15m = dwrDaily.rain15m;
+          rain12h = dwrDaily.rain12h;
+
+          // Rule: If previous telemetry exists, subtract previous 12h rain from current 12h rain
+          const [prev] = await db
+            .select({
+              rainfall12h: telemetryLatest.rainfall12h,
+              rainfall1h: telemetryLatest.rainfall1h,
+            })
+            .from(telemetryLatest)
+            .where(eq(telemetryLatest.stationId, st.id));
+          const prev12h = prev?.rainfall12h ?? prev?.rainfall1h ?? 0;
+          const diff = Number((dwrDaily.rain12h - prev12h).toFixed(1));
+          rain1h = diff >= 0 && diff <= 300 ? diff : rain15m;
+          dwrFallbackRecord = {
+            datetime: latestTime.toISOString(),
+            rainfallMm: rain1h,
+          };
+        } else {
+          const dwrRes = await dwrScraper.scrapeStationLatest(st.oldcode, { hourlyOnly: true });
+          if (dwrRes.success && dwrRes.latestRecord) {
+            const dwrTime = parseThaiWaterDate(dwrRes.latestRecord.datetime);
+            if (!isNaN(dwrTime.getTime()) && dwrTime.getTime() >= latestTime.getTime()) {
+              latestTime = dwrTime;
+              freshness = this.calculateFreshness(dwrTime);
+              rain1h = dwrRes.latestRecord.rainfallMm;
+              dwrFallbackRecord = dwrRes.latestRecord;
+            }
+          }
+        }
+      }
+    } else {
+      latestTime = parseThaiWaterDate(dwrFallbackRecord!.datetime);
+      freshness = this.calculateFreshness(latestTime);
+      rain1h = dwrFallbackRecord!.rainfallMm;
+    }
 
     const last3Items = items.slice(-3);
-    const rain3h = last3Items.reduce((acc, curr) => acc + (curr.value || 0), 0);
+    const rain3h = dwrFallbackRecord && items.length === 0
+      ? dwrFallbackRecord.rainfallMm
+      : last3Items.reduce((acc, curr) => acc + (curr.value || 0), 0);
 
     const last6Items = items.slice(-6);
-    const rain6h = last6Items.reduce((acc, curr) => acc + (curr.value || 0), 0);
+    const rain6h = dwrFallbackRecord && items.length === 0
+      ? dwrFallbackRecord.rainfallMm
+      : last6Items.reduce((acc, curr) => acc + (curr.value || 0), 0);
 
     const last24Items = items.slice(-24);
-    const rain24h = last24Items.reduce((acc, curr) => acc + (curr.value || 0), 0);
+    let rain24h = dwrFallbackRecord && items.length === 0
+      ? dwrFallbackRecord.rainfallMm
+      : last24Items.reduce((acc, curr) => acc + (curr.value || 0), 0);
+
+    if (dwrFallbackRecord) {
+      rain24h = Math.max(rain24h, dwrFallbackRecord.rainfallMm);
+    }
 
     let situationStatus: SituationStatus = "normal";
     let alertReasonTh: string | null = null;
@@ -322,7 +409,6 @@ export class ThaiWaterIngestionService {
       alertReasonEn = `Continuous moderate-to-heavy rain: 24h ${rain24h.toFixed(1)} mm.`;
     }
 
-    const freshness = this.calculateFreshness(latestTime);
 
     // 1. Overwrite / Replace current.json directly on R2
     const currentPayload: StationCurrentDataset = {
@@ -337,9 +423,11 @@ export class ThaiWaterIngestionService {
       alertReason: alertReasonTh ? { th: alertReasonTh, en: alertReasonEn || "" } : undefined,
       isUpstreamAlert: false,
       rainfall: {
+        value15m: rain15m,
         value1h: rain1h,
         value3h: rain3h,
         value6h: rain6h,
+        value12h: rain12h,
         value24h: rain24h,
         valueToday: rain24h * 0.7,
         intensity: this.calculateRainIntensity(rain24h),
@@ -354,7 +442,14 @@ export class ThaiWaterIngestionService {
       timestamp: parseThaiWaterDate(i.datetime).toISOString(),
       rainfall: i.value,
     }));
+    if (dwrFallbackRecord && items.length === 0) {
+      observations.push({
+        timestamp: latestTime.toISOString(),
+        rainfall: dwrFallbackRecord.rainfallMm,
+      });
+    }
     await this.append7DayChunkHistory(basinSlug, st.id, "rainfall", observations);
+
 
     // 3. Update telemetry_latest in DB (Secondary Cache for Fast Queries)
     await db
@@ -363,9 +458,11 @@ export class ThaiWaterIngestionService {
         stationId: st.id,
         basinId: st.basinId,
         timestamp: latestTime,
+        rainfall15m: rain15m,
         rainfall1h: rain1h,
         rainfall3h: rain3h,
         rainfall6h: rain6h,
+        rainfall12h: rain12h,
         rainfall24h: rain24h,
         rainfallToday: rain24h * 0.7,
         situationStatus,
@@ -379,9 +476,11 @@ export class ThaiWaterIngestionService {
         target: telemetryLatest.stationId,
         set: {
           timestamp: latestTime,
+          rainfall15m: rain15m,
           rainfall1h: rain1h,
           rainfall3h: rain3h,
           rainfall6h: rain6h,
+          rainfall12h: rain12h,
           rainfall24h: rain24h,
           rainfallToday: rain24h * 0.7,
           situationStatus,
